@@ -105,6 +105,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
 )
 
 STRUCT_ROOT = -1
@@ -213,6 +214,9 @@ class ConstructWriter(SchemaVisitorPerPrimitiveType[Writer]):
     def visit_geography(self, geography_type: "GeographyType") -> Writer:
         """Geography is written as WKB bytes in Avro."""
         return BinaryWriter()
+
+    def visit_variant(self, variant_type: VariantType) -> Writer:
+        raise NotImplementedError("Variant is not supported in Avro files")
 
 
 CONSTRUCT_WRITER_VISITOR = ConstructWriter()
@@ -377,6 +381,9 @@ class WriteSchemaResolver(PrimitiveWithPartnerVisitor[IcebergType, Writer]):
         """Geography is written as WKB bytes in Avro."""
         return BinaryWriter()
 
+    def visit_variant(self, variant_type: VariantType, partner: IcebergType | None) -> Writer:
+        raise NotImplementedError("Variant is not supported in Avro files")
+
 
 class ReadSchemaResolver(PrimitiveWithPartnerVisitor[IcebergType, Reader]):
     __slots__ = ("read_types", "read_enums", "context")
@@ -538,6 +545,9 @@ class ReadSchemaResolver(PrimitiveWithPartnerVisitor[IcebergType, Reader]):
     def visit_geography(self, geography_type: "GeographyType", partner: IcebergType | None) -> Reader:
         """Geography is read as WKB bytes from Avro."""
         return BinaryReader()
+
+    def visit_variant(self, variant_type: VariantType, partner: IcebergType | None) -> Reader:
+        raise NotImplementedError("Variant is not supported in Avro files")
 
 
 class SchemaPartnerAccessor(PartnerAccessor[IcebergType]):

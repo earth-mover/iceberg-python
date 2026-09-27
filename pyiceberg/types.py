@@ -245,6 +245,8 @@ class IcebergType(IcebergBaseModel):
                 return BinaryType()
             if v == "unknown":
                 return UnknownType()
+            if v == "variant":
+                return VariantType()
             if v.startswith("fixed"):
                 return FixedType(_parse_fixed_type(v))
             if v.startswith("decimal"):
@@ -1000,6 +1002,29 @@ class UnknownType(PrimitiveType):
     """
 
     root: Literal["unknown"] = Field(default="unknown")
+
+    def minimum_format_version(self) -> TableVersion:
+        return 3
+
+
+class VariantType(PrimitiveType):
+    """A variant data type in Iceberg (v3+) for storing semi-structured values.
+
+    Values are stored in the Variant binary encoding as a ``metadata`` and a ``value`` binary. The spec
+    defines variant as a semi-structured type; PyIceberg models it as a primitive because it cannot be
+    projected into and has no Iceberg field ids below it.
+
+    Example:
+        >>> column_foo = VariantType()
+        >>> isinstance(column_foo, VariantType)
+        True
+        >>> column_foo
+        VariantType()
+        >>> str(column_foo)
+        'variant'
+    """
+
+    root: Literal["variant"] = Field(default="variant")
 
     def minimum_format_version(self) -> TableVersion:
         return 3

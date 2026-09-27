@@ -26,7 +26,7 @@ from pyiceberg.expressions import AlwaysTrue, BooleanExpression
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile, PartitionFieldSummary
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.table.snapshots import Snapshot, ancestors_of
-from pyiceberg.types import GeographyType, GeometryType, IcebergType, PrimitiveType, UnknownType
+from pyiceberg.types import GeographyType, GeometryType, IcebergType, PrimitiveType, UnknownType, VariantType
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.singleton import _convert_to_hashable_type
 
@@ -41,6 +41,9 @@ ALWAYS_TRUE = AlwaysTrue()
 def _readable_bound(field_type: PrimitiveType, bound: bytes | None) -> Any | None:
     if bound is None or isinstance(field_type, UnknownType):
         return None
+    if isinstance(field_type, VariantType):
+        # Variant bounds are serialized Variant objects keyed by field path, surfaced as raw bytes
+        return bound
     return from_bytes(field_type, bound)
 
 
@@ -50,7 +53,7 @@ def _readable_bound_arrow_type(field_type: IcebergType) -> pa.DataType:
 
     from pyiceberg.io.pyarrow import schema_to_pyarrow
 
-    if isinstance(field_type, (GeometryType, GeographyType)):
+    if isinstance(field_type, (GeometryType, GeographyType, VariantType)):
         # Geo bounds are WKB bounding-box points, surfaced as raw bytes rather than as a GeoArrow extension type
         return pa.binary()
     if isinstance(field_type, UnknownType):

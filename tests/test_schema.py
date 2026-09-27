@@ -61,6 +61,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
 )
 
 TEST_PRIMITIVE_TYPES = [
@@ -1004,6 +1005,21 @@ def test_unknown_type_promotion_to_primitive() -> None:
     assert promote(unknown_type, IntegerType()) == IntegerType()
     assert promote(unknown_type, BooleanType()) == BooleanType()
     assert promote(unknown_type, FloatType()) == FloatType()
+
+
+def test_variant_group_struct_promotion_to_variant() -> None:
+    variant_group = StructType(
+        NestedField(3, "metadata", BinaryType(), required=True), NestedField(4, "value", BinaryType(), required=True)
+    )
+    assert promote(variant_group, VariantType()) == VariantType()
+
+    with pytest.raises(ResolveError, match="Cannot promote"):
+        promote(StructType(NestedField(3, "metadata", BinaryType(), required=True)), VariantType())
+    with pytest.raises(ResolveError, match="Cannot promote"):
+        promote(
+            StructType(NestedField(3, "metadata", BinaryType()), NestedField(4, "value", StringType())),
+            VariantType(),
+        )
 
 
 def test_unknown_type_promotion_to_non_primitive_raises_resolve_error() -> None:

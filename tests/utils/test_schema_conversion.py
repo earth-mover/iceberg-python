@@ -431,3 +431,21 @@ def test_iceberg_to_avro_manifest(avro_schema_manifest_entry: dict[str, Any]) ->
     iceberg_schema = AvroSchemaConversion().avro_to_iceberg(avro_schema_manifest_entry)
     avro_result = AvroSchemaConversion().iceberg_to_avro(iceberg_schema, schema_name="manifest_entry")
     assert avro_schema_manifest_entry == avro_result
+
+
+def test_iceberg_variant_to_avro() -> None:
+    from pyiceberg.types import NestedField, VariantType
+
+    schema = Schema(NestedField(1, "v", VariantType(), required=False))
+    avro_schema = AvroSchemaConversion().iceberg_to_avro(schema, schema_name="table")
+
+    assert isinstance(avro_schema, dict)
+    assert avro_schema["fields"][0]["type"] == [
+        "null",
+        {
+            "type": "record",
+            "logicalType": "variant",
+            "fields": [{"name": "metadata", "type": "bytes"}, {"name": "value", "type": "bytes"}],
+            "name": "r1",
+        },
+    ]

@@ -113,6 +113,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
 )
 
 
@@ -679,3 +680,14 @@ def test_unknown_type_conversions() -> None:
 def test_geo_json_null_default(geo_type: PrimitiveType) -> None:
     """Geometry and geography columns must default to null, so null deserializes to None."""
     assert conversions.from_json(geo_type, None) is None
+
+
+def test_variant_type_conversions() -> None:
+    assert conversions.to_json(VariantType(), None) is None
+    assert conversions.from_json(VariantType(), None) is None
+    with pytest.raises(ValueError, match="must default to null"):
+        conversions.from_json(VariantType(), {"a": 1})
+    with pytest.raises(ValueError, match="no single-value binary serialization"):
+        conversions.to_bytes(VariantType(), b"\x00")
+    with pytest.raises(ValueError, match="no single-value binary serialization"):
+        conversions.from_bytes(VariantType(), b"\x00")

@@ -1838,6 +1838,25 @@ and `_last_updated_sequence_number` from the data sequence number of the file. B
 added before row lineage was enabled. The columns are read-only: appending a dataframe that contains them is rejected by
 the schema compatibility check.
 
+### Variant columns
+
+On format version 3 tables, `variant` columns are read as a struct of two binaries, `metadata` and `value`, holding
+the Variant binary encoding. `pyiceberg.variant` decodes a value to JSON or to Python objects:
+
+```python
+from pyiceberg.variant import to_json, to_python
+
+for row in table.scan(selected_fields=("id", "v")).to_arrow().to_pylist():
+    v = row["v"]
+    if v is not None:
+        print(row["id"], to_json(v["metadata"], v["value"]), to_python(v["metadata"], v["value"]))
+```
+
+`to_python` returns `dict`, `list`, `str`, `int`, `float`, `Decimal`, `bytes`, `date`, `time`, `datetime` or `UUID`
+values. Shredded variant files (with a `typed_value` field) cannot be read yet and raise `NotImplementedError` when the
+column is projected. Writing variant columns is not supported until PyArrow can annotate the Parquet `VARIANT`
+logical type.
+
 ### Apache Arrow
 
 <!-- prettier-ignore-start -->

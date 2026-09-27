@@ -286,3 +286,63 @@ def test_record_equality_for_partition_lookup() -> None:
 
     assert len(index.for_data_file(1, data_file, partition_b)) == 1
     assert len(index.for_data_file(1, data_file, partition_c)) == 0
+
+
+def _create_equality_delete(sequence_number: int = 1, spec_id: int = 0, partition: Record | None = None) -> ManifestEntry:
+    delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=f"s3://bucket/eq-delete-{spec_id}-{sequence_number}.parquet",
+        file_format=FileFormat.PARQUET,
+        partition=partition or Record(),
+        record_count=10,
+        file_size_in_bytes=100,
+        equality_ids=[1],
+    )
+    delete_file._spec_id = spec_id
+    return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
+
+
+def test_equality_deletes_apply_to_strictly_older_data() -> None:
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_equality_delete(sequence_number=2))
+    index.add_delete_file(_create_equality_delete(sequence_number=4))
+    data_file = _create_data_file()
+
+    assert not index.is_empty()
+    assert {f.file_path for f in index.for_data_file(1, data_file)} == {
+        "s3://bucket/eq-delete-0-2.parquet",
+        "s3://bucket/eq-delete-0-4.parquet",
+    }
+    # an equality delete with the same data sequence number as the data file does not apply
+    assert {f.file_path for f in index.for_data_file(2, data_file)} == {"s3://bucket/eq-delete-0-4.parquet"}
+    assert len(index.for_data_file(4, data_file)) == 0
+    assert len(index.referenced_delete_files()) == 2
+
+
+def test_partitioned_equality_deletes_apply_to_same_partition() -> None:
+    partition = Record(1)
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_equality_delete(sequence_number=2, spec_id=1, partition=partition), partition_key=partition)
+    data_file = _create_data_file(spec_id=1)
+
+    assert len(index.for_data_file(1, data_file, partition_key=Record(1))) == 1
+    assert len(index.for_data_file(1, data_file, partition_key=Record(2))) == 0
+    assert len(index.for_data_file(1, _create_data_file(spec_id=0), partition_key=Record(1))) == 0
+
+
+def test_unpartitioned_equality_deletes_are_global() -> None:
+    index = DeleteFileIndex()
+    # stored with an unpartitioned spec, so it applies to data files in every spec and partition
+    index.add_delete_file(_create_equality_delete(sequence_number=2, spec_id=0))
+    data_file = _create_data_file(spec_id=1)
+
+    assert len(index.for_data_file(1, data_file, partition_key=Record(7))) == 1
+
+
+def test_equality_deletes_are_kept_alongside_dvs() -> None:
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_deletion_vector(sequence_number=3))
+    index.add_delete_file(_create_equality_delete(sequence_number=2))
+
+    delete_files = index.for_data_file(1, _create_data_file())
+    assert {f.content for f in delete_files} == {DataFileContent.POSITION_DELETES, DataFileContent.EQUALITY_DELETES}

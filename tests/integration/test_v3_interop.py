@@ -25,6 +25,7 @@ import json
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -44,8 +45,11 @@ from pyiceberg.types import (
     TimestampNanoType,
     TimestamptzNanoType,
     UnknownType,
+    VariantType,
 )
 from pyiceberg.utils.geo import GeospatialBound
+from pyiceberg.variant import to_json as variant_to_json
+from pyiceberg.variant import to_python as variant_to_python
 
 NS_VALUES = [1704067200123456789, 1706832000000000001, None]
 NS_PARTITIONS = [
@@ -218,12 +222,66 @@ def test_v3_unknown_column_reads_as_null(session_catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="VariantType is not implemented")
 def test_v3_variant_table_loads(session_catalog: Catalog, spark: "SparkSession", probe_identifier: str) -> None:  # type: ignore[name-defined] # noqa: F821
     spark.sql(f"CREATE TABLE rest.{probe_identifier} (id INT, v VARIANT) USING iceberg TBLPROPERTIES ('format-version'='3')")
     spark.sql(f"""INSERT INTO rest.{probe_identifier} SELECT 1, parse_json('{{"a": 1}}')""")
     table = session_catalog.load_table(probe_identifier)
+    assert isinstance(table.schema().find_type("v"), VariantType)
     assert table.scan().count() == 1
+    (row,) = table.scan().to_arrow().to_pylist()
+    assert json.loads(variant_to_json(row["v"]["metadata"], row["v"]["value"])) == {"a": 1}
+
+    spark.sql(
+        f"""INSERT INTO rest.{probe_identifier} VALUES
+        (2, parse_json('[1, "two", null, 3.5]')),
+        (3, parse_json('"just a string"')),
+        (4, parse_json('null')),
+        (5, NULL),
+        (6, parse_json('{{"nested": {{"b": [true, false]}}, "s": "x"}}'))"""
+    )
+    table = session_catalog.load_table(probe_identifier)
+    rows = {row["id"]: row["v"] for row in table.scan().to_arrow().to_pylist()}
+    decoded = {id_: None if v is None else variant_to_python(v["metadata"], v["value"]) for id_, v in rows.items()}
+    assert decoded == {
+        1: {"a": 1},
+        2: [1, "two", None, Decimal("3.5")],
+        3: "just a string",
+        4: None,
+        5: None,
+        6: {"nested": {"b": [True, False]}, "s": "x"},
+    }
+    # the JSON matches Spark's rendering of the same values
+    expected_json = {r["id"]: r["j"] for r in spark.sql(f"SELECT id, to_json(v) AS j FROM rest.{probe_identifier}").collect()}
+    for id_, v in rows.items():
+        if v is not None:
+            assert json.loads(variant_to_json(v["metadata"], v["value"])) == json.loads(expected_json[id_])
+
+    # variant columns cannot be written until pyarrow can annotate the Parquet VARIANT logical type
+    with pytest.raises(NotImplementedError, match="Writing variant is not supported"):
+        table.append(table.scan().to_arrow())
+
+
+# ---------------------------------------------------------------------------- equality deletes
+
+
+@pytest.mark.integration
+def test_v3_equality_deletes_match_spark(session_catalog: Catalog, spark: "SparkSession") -> None:  # type: ignore[name-defined] # noqa: F821
+    identifier = "default.test_v3_equality_deletes"
+    table = session_catalog.load_table(identifier)
+    delete_files = table.inspect.delete_files().to_pylist()
+    assert {d["content"] for d in delete_files} == {2}
+    assert sorted(d["equality_ids"] for d in delete_files) == [[1], [2]]
+
+    expected = sorted(tuple(r) for r in spark.sql(f"SELECT id, name, value FROM rest.{identifier}").collect())
+    # id 2 and 5 are deleted by id, id 4 by its null name; the row added after the deletes is kept
+    assert expected == [(1, "a", 1.0), (2, "b2", 20.0), (3, "c", 3.0)]
+    actual = sorted((r["id"], r["name"], r["value"]) for r in table.scan().to_arrow().to_pylist())
+    assert actual == expected
+    assert table.scan().count() == len(expected)
+
+    # the delete columns are applied even when they are not projected
+    assert sorted(r["value"] for r in table.scan(selected_fields=("value",)).to_arrow().to_pylist()) == [1.0, 3.0, 20.0]
+    assert [r["id"] for r in table.scan(row_filter=EqualTo("id", 2)).to_arrow().to_pylist()] == [2]
 
 
 # ---------------------------------------------------------------------------- row lineage and deletion vectors

@@ -185,6 +185,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
     strtobool,
 )
 from pyiceberg.utils.concurrent import ExecutorFactory
@@ -834,6 +835,10 @@ class _ConvertToArrowSchema(SchemaVisitorPerPrimitiveType[pa.DataType]):
     def visit_binary(self, _: BinaryType) -> pa.DataType:
         return pa.large_binary()
 
+    def visit_variant(self, _: VariantType) -> pa.DataType:
+        """Convert variant type to the struct that PyArrow reads an unshredded Parquet VARIANT group as."""
+        return _VARIANT_ARROW_TYPE
+
     def visit_geometry(self, geometry_type: GeometryType) -> pa.DataType:
         """Convert geometry type to PyArrow type.
 
@@ -1294,14 +1299,50 @@ def visit_pyarrow(obj: pa.DataType | pa.Schema, visitor: PyArrowSchemaVisitor[T]
 
 @visit_pyarrow.register(pa.Schema)
 def _(obj: pa.Schema, visitor: PyArrowSchemaVisitor[T]) -> T:
-    return visitor.schema(obj, visit_pyarrow(pa.struct(obj), visitor))
+    # The root is always a struct, even when its columns are named like the fields of a variant
+    struct = pa.struct(obj)
+    return visitor.schema(obj, visitor.struct(struct, [visit_pyarrow(field, visitor) for field in struct]))
 
 
 @visit_pyarrow.register(pa.StructType)
 def _(obj: pa.StructType, visitor: PyArrowSchemaVisitor[T]) -> T:
+    if _is_variant_group(obj):
+        return visitor.variant(obj)
+
     results = [visit_pyarrow(field, visitor) for field in obj]
 
     return visitor.struct(obj, results)
+
+
+_VARIANT_METADATA = "metadata"
+_VARIANT_VALUE = "value"
+_VARIANT_TYPED_VALUE = "typed_value"
+_VARIANT_ARROW_TYPE = pa.struct(
+    [
+        pa.field(_VARIANT_METADATA, pa.binary(), nullable=False),
+        pa.field(_VARIANT_VALUE, pa.binary(), nullable=False),
+    ]
+)
+
+
+def _is_binary_like(arrow_type: pa.DataType) -> bool:
+    return pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type) or pa.types.is_binary_view(arrow_type)
+
+
+def _is_variant_group(struct: pa.StructType) -> bool:
+    """Return whether a struct is a Parquet VARIANT group, unshredded or shredded.
+
+    The spec forbids field ids on the ``metadata``, ``value`` and ``typed_value`` fields of a variant, while
+    every Iceberg struct field carries one, which tells the two apart.
+    """
+    names = {field.name for field in struct}
+    if _VARIANT_METADATA not in names or not names <= {_VARIANT_METADATA, _VARIANT_VALUE, _VARIANT_TYPED_VALUE}:
+        return False
+    if names == {_VARIANT_METADATA}:
+        return False
+    if any(_get_field_id(field) is not None for field in struct):
+        return False
+    return all(_is_binary_like(field.type) for field in struct if field.name != _VARIANT_TYPED_VALUE)
 
 
 @visit_pyarrow.register(pa.ListType)
@@ -1361,6 +1402,10 @@ def _(obj: pa.DataType, visitor: PyArrowSchemaVisitor[T]) -> T:
 class PyArrowSchemaVisitor(Generic[T], ABC):
     def before_field(self, field: pa.Field) -> None:
         """Override this method to perform an action immediately before visiting a field."""
+
+    def variant(self, variant_group: pa.StructType) -> T:
+        """Visit a Parquet VARIANT group, which is a plain struct unless a visitor overrides this."""
+        return self.struct(variant_group, [visit_pyarrow(field, self) for field in variant_group])
 
     def after_field(self, field: pa.Field) -> None:
         """Override this method to perform an action immediately after visiting a field."""
@@ -1426,6 +1471,10 @@ class _HasIds(PyArrowSchemaVisitor[bool]):
     def schema(self, schema: pa.Schema, struct_result: bool) -> bool:
         return struct_result
 
+    def variant(self, variant_group: pa.StructType) -> bool:
+        # The fields of a variant never carry field ids
+        return True
+
     def struct(self, struct: pa.StructType, field_results: builtins.list[bool]) -> bool:
         return all(field_results)
 
@@ -1471,6 +1520,9 @@ class _ConvertToIceberg(PyArrowSchemaVisitor[IcebergType | Schema]):
 
     def struct(self, struct: pa.StructType, field_results: builtins.list[NestedField]) -> StructType:
         return StructType(*field_results)
+
+    def variant(self, variant_group: pa.StructType) -> IcebergType | Schema:
+        return VariantType()
 
     def field(self, field: pa.Field, field_result: IcebergType) -> NestedField:
         field_id = self._field_id(field)
@@ -1664,6 +1716,10 @@ class _ConvertToIcebergWithoutIDs(_ConvertToIceberg):
     def _field_id(self, field: pa.Field) -> int:
         return -1
 
+    def variant(self, variant_group: pa.StructType) -> IcebergType | Schema:
+        # Without field ids a variant cannot be told apart from a struct with metadata and value fields
+        return PyArrowSchemaVisitor.variant(self, variant_group)
+
 
 def _get_column_projection_values(
     file: DataFile,
@@ -1695,6 +1751,174 @@ def _get_column_projection_values(
 _ROW_POSITION_COLUMN = "__pyiceberg_row_position"
 
 
+@dataclass(frozen=True)
+class _EqualityDeletes:
+    """The rows of one equality delete file, projected onto its delete columns.
+
+    Attributes:
+        field_ids: The field ids of the delete columns (the file's ``equality_ids``).
+        rows: The delete rows, with one column per delete column named after its field id.
+    """
+
+    field_ids: tuple[int, ...]
+    rows: pa.Table
+
+
+def _field_path(schema: Schema, field_id: int) -> list[str] | None:
+    """Return the names from the root of the schema to the field, or None when the field is not in the schema."""
+    if field_id not in schema._lazy_id_to_field:
+        return None
+    parents = schema._lazy_id_to_parent
+    names = [schema.find_field(field_id).name]
+    parent_id = parents.get(field_id)
+    while parent_id is not None:
+        names.append(schema.find_field(parent_id).name)
+        parent_id = parents.get(parent_id)
+    return list(reversed(names))
+
+
+def _column_by_path(data: pa.RecordBatch | pa.Table, path: list[str]) -> pa.Array | pa.ChunkedArray:
+    """Return a (possibly nested) column; a null parent struct yields a null value."""
+    column = data.column(path[0])
+    for name in path[1:]:
+        column = pc.struct_field(column, name)
+    return column
+
+
+def _read_equality_deletes(
+    io: FileIO,
+    delete_file: DataFile,
+    name_mapping: NameMapping | None = None,
+    format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
+) -> _EqualityDeletes:
+    """Read the delete columns of an equality delete file, matching them to the table by field id.
+
+    Other columns stored in the delete file are ignored.
+    """
+    if not delete_file.equality_ids:
+        raise ValueError(f"Equality delete file has no equality_ids: {delete_file.file_path}")
+    if delete_file.file_format not in (FileFormat.PARQUET, FileFormat.ORC):
+        raise ValueError(f"Equality delete file format not supported: {delete_file.file_format}")
+
+    with io.new_input(delete_file.file_path).open() as fi:
+        fragment = _get_file_format(delete_file.file_format).make_fragment(fi)
+        file_schema = pyarrow_to_schema(
+            fragment.physical_schema,
+            name_mapping,
+            downcast_ns_timestamp_to_us=format_version <= 2,
+            format_version=format_version,
+        )
+        paths: dict[int, list[str]] = {}
+        for field_id in delete_file.equality_ids:
+            path = _field_path(file_schema, field_id)
+            if path is None:
+                raise ValueError(f"Equality delete file {delete_file.file_path} is missing the delete column with id {field_id}")
+            paths[field_id] = path
+        columns = list(dict.fromkeys(path[0] for path in paths.values()))
+        table = ds.Scanner.from_fragment(fragment=fragment, columns=columns).to_table()
+
+    rows = pa.table({str(field_id): _column_by_path(table, path) for field_id, path in paths.items()})
+    return _EqualityDeletes(field_ids=tuple(paths), rows=rows)
+
+
+def _normalize_key_array(array: pa.Array | pa.ChunkedArray) -> pa.Array:
+    """Return a plain array that Arrow compute kernels can compare."""
+    if isinstance(array, pa.ChunkedArray):
+        array = array.combine_chunks()
+    if isinstance(array, pa.DictionaryArray):
+        array = array.dictionary_decode()
+    if isinstance(array, pa.ExtensionArray):
+        array = array.storage
+    return array
+
+
+def _align_key_arrays(data: pa.Array, deletes: pa.Array) -> tuple[pa.Array, pa.Array]:
+    """Cast the data and delete values of one delete column to a common type."""
+    if data.type == deletes.type:
+        return data, deletes
+    try:
+        return data.cast(deletes.type), deletes
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        return data, deletes.cast(data.type)
+
+
+def _equality_delete_mask(data_keys: list[pa.Array], delete_keys: list[pa.Array | pa.ChunkedArray]) -> pa.Array:
+    """Return a mask that is true for each data row equal to any delete row on all delete columns.
+
+    Following the spec, a null value is equal to a null value.
+    """
+    num_rows = len(data_keys[0])
+    aligned = [
+        _align_key_arrays(_normalize_key_array(data), _normalize_key_array(deletes))
+        for data, deletes in zip(data_keys, delete_keys, strict=True)
+    ]
+
+    if len(aligned) == 1:
+        data, deletes = aligned[0]
+        # is_in matches a null input against a null in the value set
+        return pc.fill_null(pc.is_in(data, value_set=deletes), False)
+
+    # A hash join never matches null keys, so each column is joined on a null flag plus its value with nulls filled
+    left: dict[str, pa.Array] = {"__pos": pa.array(range(num_rows), type=pa.int64())}
+    right: dict[str, pa.Array] = {}
+    keys: list[str] = []
+    for index, (data, deletes) in enumerate(aligned):
+        keys.append(f"null_{index}")
+        left[keys[-1]] = pc.is_null(data)
+        right[keys[-1]] = pc.is_null(deletes)
+        non_null = pc.drop_null(data) if data.null_count < len(data) else pc.drop_null(deletes)
+        if len(non_null) > 0:
+            keys.append(f"value_{index}")
+            left[keys[-1]] = pc.fill_null(data, non_null[0])
+            right[keys[-1]] = pc.fill_null(deletes, non_null[0])
+
+    delete_table = pa.table(right).group_by(keys).aggregate([])
+    matched = pa.table(left).join(delete_table, keys=keys, join_type="left semi")
+    return pc.is_in(left["__pos"], value_set=matched.column("__pos"))
+
+
+def _equality_key_arrays(
+    batch: pa.RecordBatch,
+    deletes: _EqualityDeletes,
+    data_paths: dict[int, list[str] | None],
+    missing_values: dict[int, Any],
+) -> list[pa.Array]:
+    """Return the values of the delete columns for the rows of a data batch."""
+    keys: list[pa.Array] = []
+    for field_id in deletes.field_ids:
+        path = data_paths.get(field_id)
+        if path is not None:
+            keys.append(_column_by_path(batch, path))
+        else:
+            # A delete column that the data file does not contain takes its projected value, or null
+            delete_type = deletes.rows.column(str(field_id)).type
+            value = missing_values.get(field_id)
+            keys.append(
+                pa.nulls(batch.num_rows, delete_type)
+                if value is None
+                else pa.repeat(pa.scalar(value, delete_type), batch.num_rows)
+            )
+    return keys
+
+
+def _equality_missing_values(
+    task: FileScanTask, table_schema: Schema, partition_spec: PartitionSpec | None, field_ids: set[int]
+) -> dict[int, Any]:
+    """Return the projected values of delete columns that a data file does not contain."""
+    if not field_ids:
+        return EMPTY_DICT
+    values = dict(
+        _get_column_projection_values(
+            task.file, prune_columns(table_schema, field_ids, select_full_types=False), table_schema, partition_spec, set()
+        )
+    )
+    for field_id in field_ids:
+        field = table_schema._lazy_id_to_field.get(field_id)
+        if field_id not in values and field is not None and field.initial_default is not None:
+            values[field_id] = field.initial_default
+    return {field_id: value for field_id, value in values.items() if field_id in field_ids}
+
+
 def _task_to_record_batches(
     io: FileIO,
     task: FileScanTask,
@@ -1709,6 +1933,7 @@ def _task_to_record_batches(
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
     downcast_ns_timestamp_to_us: bool | None = None,
     dictionary_columns: tuple[str, ...] = (),
+    equality_deletes: list[_EqualityDeletes] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     format_kwargs: dict[str, Any] = {"pre_buffer": True, "buffer_size": ONE_MEGABYTE * 8}
     if dictionary_columns and task.file.file_format == FileFormat.PARQUET:
@@ -1741,7 +1966,13 @@ def _task_to_record_batches(
             bound_file_filter = bind(file_schema, translated_row_filter, case_sensitive=case_sensitive)
             pyarrow_filter = expression_to_pyarrow(bound_file_filter, file_schema)
 
-        file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
+        # Equality deletes compare the delete columns, so they are read even when not projected
+        equality_field_ids = {field_id for deletes in equality_deletes or () for field_id in deletes.field_ids}
+        file_project_schema = prune_columns(file_schema, projected_field_ids | equality_field_ids, select_full_types=False)
+        equality_paths = {field_id: _field_path(file_schema, field_id) for field_id in equality_field_ids}
+        equality_missing_values = _equality_missing_values(
+            task, table_schema, partition_spec, {field_id for field_id, path in equality_paths.items() if path is None}
+        )
 
         # Row lineage columns are derived from the position of each row in the file
         track_positions = ROW_ID.field_id in projected_schema.field_ids
@@ -1770,6 +2001,20 @@ def _task_to_record_batches(
                 current_batch = current_batch.take(indices)
                 if positions is not None:
                     positions = positions.take(indices)
+
+            if equality_deletes and current_batch.num_rows > 0:
+                # Equality deletes apply after positional deletes, so positions still refer to the data file
+                deleted = None
+                for deletes in equality_deletes:
+                    data_keys = _equality_key_arrays(current_batch, deletes, equality_paths, equality_missing_values)
+                    delete_keys = [deletes.rows.column(str(field_id)) for field_id in deletes.field_ids]
+                    mask = _equality_delete_mask(data_keys, delete_keys)
+                    deleted = mask if deleted is None else pc.or_(deleted, mask)
+                if deleted is not None:
+                    indices = pc.indices_nonzero(pc.invert(deleted))
+                    current_batch = current_batch.take(indices)
+                    if positions is not None:
+                        positions = positions.take(indices)
 
             if apply_filter_after_read and pyarrow_filter is not None:
                 if positions is not None:
@@ -1844,7 +2089,9 @@ def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[st
     # it was planned for (for example, a DV supersedes older position deletes for its data file)
     planned_deletes: dict[str, DeleteFileSet] = {}
     for task in tasks:
-        planned_deletes.setdefault(task.file.file_path, DeleteFileSet()).update(task.delete_files)
+        planned_deletes.setdefault(task.file.file_path, DeleteFileSet()).update(
+            delete_file for delete_file in task.delete_files if delete_file.content != DataFileContent.EQUALITY_DELETES
+        )
     unique_deletes = DeleteFileSet(itertools.chain.from_iterable(planned_deletes.values()))
     if len(unique_deletes) > 0:
         executor = ExecutorFactory.get_or_create()
@@ -1863,6 +2110,41 @@ def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[st
                     deletes_per_file[file] = [arr]
 
     return deletes_per_file
+
+
+def _read_all_equality_delete_files(
+    io: FileIO,
+    tasks: Iterable[FileScanTask],
+    name_mapping: NameMapping | None = None,
+    format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
+) -> dict[str, list[_EqualityDeletes]]:
+    """Read every equality delete file planned for the tasks once, and group them by data file path."""
+    planned_deletes: dict[str, DeleteFileSet] = {}
+    for task in tasks:
+        equality_deletes = [
+            delete_file for delete_file in task.delete_files if delete_file.content == DataFileContent.EQUALITY_DELETES
+        ]
+        if equality_deletes:
+            planned_deletes.setdefault(task.file.file_path, DeleteFileSet()).update(equality_deletes)
+
+    if not planned_deletes:
+        return {}
+
+    unique_deletes = list(DeleteFileSet(itertools.chain.from_iterable(planned_deletes.values())))
+    executor = ExecutorFactory.get_or_create()
+    read_deletes = dict(
+        zip(
+            (delete_file.file_path for delete_file in unique_deletes),
+            executor.map(
+                lambda delete_file: _read_equality_deletes(io, delete_file, name_mapping, format_version), unique_deletes
+            ),
+            strict=True,
+        )
+    )
+    return {
+        data_file_path: [read_deletes[delete_file.file_path] for delete_file in delete_files]
+        for data_file_path, delete_files in planned_deletes.items()
+    }
 
 
 class ArrowScan:
@@ -1968,7 +2250,11 @@ class ArrowScan:
             ResolveError: When a required field cannot be found in the file
             ValueError: When a field type in the file cannot be projected to the schema type
         """
+        tasks = list(tasks)
         deletes_per_file = _read_all_delete_files(self._io, tasks)
+        equality_deletes_per_file = _read_all_equality_delete_files(
+            self._io, tasks, self._table_metadata.name_mapping(), self._table_metadata.format_version
+        )
 
         total_row_count = 0
         executor = ExecutorFactory.get_or_create()
@@ -1977,7 +2263,7 @@ class ArrowScan:
             # Materialize the iterator here to ensure execution happens within the executor.
             # Otherwise, the iterator would be lazily consumed later (in the main thread),
             # defeating the purpose of using executor.map.
-            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file))
+            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file, equality_deletes_per_file))
 
         limit_reached = False
         for batches in executor.map(batches_for_task, tasks):
@@ -1997,7 +2283,10 @@ class ArrowScan:
                 break
 
     def _record_batches_from_scan_tasks_and_deletes(
-        self, tasks: Iterable[FileScanTask], deletes_per_file: dict[str, list[ChunkedArray]]
+        self,
+        tasks: Iterable[FileScanTask],
+        deletes_per_file: dict[str, list[ChunkedArray]],
+        equality_deletes_per_file: dict[str, list[_EqualityDeletes]] | None = None,
     ) -> Iterator[pa.RecordBatch]:
         total_row_count = 0
         for task in tasks:
@@ -2017,6 +2306,7 @@ class ArrowScan:
                 self._table_metadata.format_version,
                 self._downcast_ns_timestamp_to_us,
                 self._dictionary_columns,
+                equality_deletes=(equality_deletes_per_file or {}).get(task.file.file_path),
             )
             for batch in batches:
                 if self._limit is not None:
@@ -2055,6 +2345,17 @@ def _to_requested_schema(
         ArrowAccessor(file_schema),
     )
     return pa.RecordBatch.from_struct_array(struct_array)
+
+
+def _to_unshredded_variant(values: pa.Array) -> pa.Array:
+    """Return a variant column as a struct of its binary metadata and value."""
+    if not pa.types.is_struct(values.type) or not _is_binary_like(values.type.field(_VARIANT_METADATA).type):
+        raise ValueError(f"Unsupported schema projection from {values.type} to variant")
+    if values.type.get_field_index(_VARIANT_TYPED_VALUE) >= 0:
+        raise NotImplementedError("Reading shredded variant columns (with a typed_value field) is not yet supported")
+    if values.type.get_field_index(_VARIANT_VALUE) < 0:
+        raise ValueError(f"Unsupported schema projection from {values.type} to variant")
+    return values.cast(_VARIANT_ARROW_TYPE)
 
 
 class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]):
@@ -2110,6 +2411,10 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
 
     def _cast_if_needed(self, field: NestedField, values: pa.Array) -> pa.Array:
         file_field = self._file_schema.find_field(field.field_id)
+
+        if isinstance(field.field_type, VariantType):
+            # The file schema of a variant may be a pruned struct, so the values are checked instead
+            return _to_unshredded_variant(values)
 
         if field.field_type.is_primitive:
             if (target_type := self._arrow_type(field.field_type)) != values.type:
@@ -2393,6 +2698,10 @@ class PrimitiveToPhysicalType(SchemaVisitorPerPrimitiveType[str]):
     def visit_unknown(self, unknown_type: UnknownType) -> str:
         return "UNKNOWN"
 
+    def visit_variant(self, variant_type: VariantType) -> str:
+        # Unshredded metadata and value are both binary
+        return "BYTE_ARRAY"
+
     def visit_geometry(self, geometry_type: GeometryType) -> str:
         return "BYTE_ARRAY"
 
@@ -2672,6 +2981,10 @@ class PyArrowStatisticsCollector(PreOrderSchemaVisitor[list[StatisticsCollector]
         if is_nested and metrics_mode.type in [MetricModeTypes.TRUNCATE, MetricModeTypes.FULL]:
             metrics_mode = MetricsMode(MetricModeTypes.COUNTS)
 
+        if isinstance(primitive, VariantType) and metrics_mode.type in [MetricModeTypes.TRUNCATE, MetricModeTypes.FULL]:
+            # Variant bounds are Variant objects keyed by field path, which are not collected
+            metrics_mode = MetricsMode(MetricModeTypes.COUNTS)
+
         return [StatisticsCollector(field_id=self._field_id, iceberg_type=primitive, mode=metrics_mode, column_name=column_name)]
 
 
@@ -2756,6 +3069,9 @@ class ID2ParquetPathVisitor(PreOrderSchemaVisitor[list[ID2ParquetPath]]):
         return k + v
 
     def primitive(self, primitive: PrimitiveType) -> builtins.list[ID2ParquetPath]:
+        if isinstance(primitive, VariantType):
+            # Every variant has exactly one metadata value per row, so its column carries the counts of the variant
+            return [ID2ParquetPath(field_id=self._field_id, parquet_path=".".join([*self._path, _VARIANT_METADATA]))]
         return [ID2ParquetPath(field_id=self._field_id, parquet_path=".".join(self._path))]
 
 
@@ -2776,6 +3092,15 @@ def parquet_path_to_id_mapping(
     for pair in pre_order_visit(schema, ID2ParquetPathVisitor()):
         result[pair.parquet_path] = pair.field_id
     return result
+
+
+def _is_variant_child_path(path: str, parquet_column_mapping: dict[str, int]) -> bool:
+    """Return whether a Parquet column belongs to a variant group without being its metadata column."""
+    parts = path.split(".")
+    return any(
+        ".".join([*parts[:index], _VARIANT_METADATA]) in parquet_column_mapping and parts[index] != _VARIANT_METADATA
+        for index in range(1, len(parts))
+    )
 
 
 def data_file_statistics_from_parquet_metadata(
@@ -2828,6 +3153,10 @@ def data_file_statistics_from_parquet_metadata(
 
         for pos in range(parquet_metadata.num_columns):
             column = row_group.column(pos)
+            if column.path_in_schema not in parquet_column_mapping and _is_variant_child_path(
+                column.path_in_schema, parquet_column_mapping
+            ):
+                continue
             field_id = parquet_column_mapping[column.path_in_schema]
 
             stats_col = stats_columns[field_id]
@@ -3136,7 +3465,11 @@ def _check_pyarrow_schema_compatible(
 
     Raises:
         ValueError: If the schemas are not compatible.
+        NotImplementedError: If the schema contains a variant column.
     """
+    if any(isinstance(field.field_type, VariantType) for field in requested_schema._lazy_id_to_field.values()):
+        raise NotImplementedError("Writing variant is not supported until pyarrow can annotate the Parquet VARIANT logical type")
+
     name_mapping = requested_schema.name_mapping
 
     try:

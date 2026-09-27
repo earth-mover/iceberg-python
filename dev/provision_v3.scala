@@ -202,5 +202,45 @@ def record(schema: Schema, values: (String, Any)*): Record = {
   println("PROVISIONED test_v3_unknown")
 }
 
+// --- equality deletes (Spark SQL only writes position deletes and deletion vectors) ---
+{
+  val schema = new Schema(
+    Types.NestedField.required(1, "id", Types.IntegerType.get()),
+    Types.NestedField.optional(2, "name", Types.StringType.get()),
+    Types.NestedField.optional(3, "value", Types.DoubleType.get())
+  )
+  val table = recreate("test_v3_equality_deletes", schema)
+  appendRecords(
+    table,
+    Seq(
+      record(schema, "id" -> Integer.valueOf(1), "name" -> "a", "value" -> java.lang.Double.valueOf(1.0)),
+      record(schema, "id" -> Integer.valueOf(2), "name" -> "b", "value" -> java.lang.Double.valueOf(2.0)),
+      record(schema, "id" -> Integer.valueOf(3), "name" -> "c", "value" -> java.lang.Double.valueOf(3.0)),
+      record(schema, "id" -> Integer.valueOf(4), "value" -> java.lang.Double.valueOf(4.0)),
+      record(schema, "id" -> Integer.valueOf(5), "name" -> "e", "value" -> java.lang.Double.valueOf(5.0))
+    ),
+    "eq-data"
+  )
+
+  def writeEqDeletes(fieldIds: Array[Int], deleteSchema: Schema, rows: Seq[Record], fileName: String): org.apache.iceberg.DeleteFile = {
+    val factory = new GenericAppenderFactory(table.schema(), table.spec(), fieldIds, deleteSchema, null)
+    val out = table.io().newOutputFile(table.locationProvider().newDataLocation(s"$fileName.parquet"))
+    val writer = factory.newEqDeleteWriter(org.apache.iceberg.encryption.EncryptedFiles.plainAsEncryptedOutput(out), FileFormat.PARQUET, null)
+    try rows.foreach(writer.write) finally writer.close()
+    writer.toDeleteFile()
+  }
+
+  // delete rows by id, and by name where a null delete value matches a null data value
+  val idSchema = table.schema().select("id")
+  val nameSchema = table.schema().select("name")
+  val byId = writeEqDeletes(Array(1), idSchema, Seq(record(idSchema, "id" -> Integer.valueOf(2)), record(idSchema, "id" -> Integer.valueOf(5))), "eq-delete-id")
+  val byName = writeEqDeletes(Array(2), nameSchema, Seq(record(nameSchema)), "eq-delete-name")
+  table.newRowDelta().addDeletes(byId).addDeletes(byName).commit()
+
+  // rows added after the deletes are not affected by them
+  appendRecords(table, Seq(record(schema, "id" -> Integer.valueOf(2), "name" -> "b2", "value" -> java.lang.Double.valueOf(20.0))), "eq-data-after")
+  println("PROVISIONED test_v3_equality_deletes")
+}
+
 println("PROVISION_V3_DONE")
 System.exit(0)

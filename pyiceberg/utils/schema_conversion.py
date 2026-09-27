@@ -58,6 +58,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
 )
 from pyiceberg.utils.datetime import date_to_days, datetime_to_micros, datetime_to_nanos, time_to_micros
 from pyiceberg.utils.decimal import decimal_required_bytes, decimal_to_bytes
@@ -683,6 +684,14 @@ class ConvertSchemaToAvro(SchemaVisitorPerPrimitiveType[AvroType]):
 
     def visit_unknown(self, unknown_type: UnknownType) -> AvroType:
         return "null"
+
+    def visit_variant(self, variant_type: VariantType) -> AvroType:
+        """Convert variant type to an Avro record whose metadata and value fields have no field ids."""
+        return {
+            "type": "record",
+            "logicalType": "variant",
+            "fields": [{"name": "metadata", "type": "bytes"}, {"name": "value", "type": "bytes"}],
+        }
 
     def visit_geometry(self, geometry_type: GeometryType) -> AvroType:
         """Convert geometry type to Avro bytes (WKB format per Iceberg spec)."""

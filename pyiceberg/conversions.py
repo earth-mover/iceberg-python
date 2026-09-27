@@ -62,6 +62,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
     strtobool,
 )
 from pyiceberg.utils.datetime import (
@@ -331,6 +332,12 @@ def _(_: UnknownType, value: Any) -> None:
     return None
 
 
+@to_bytes.register(VariantType)
+def _(_: VariantType, value: Any) -> bytes:
+    """Raise, since the spec does not define a single-value binary serialization for variant."""
+    raise ValueError("Variant values have no single-value binary serialization")
+
+
 @singledispatch  # type: ignore
 def from_bytes(primitive_type: PrimitiveType, b: bytes) -> L:  # type: ignore
     """Convert bytes to a built-in python value.
@@ -406,6 +413,12 @@ def _(primitive_type: DecimalType, buf: bytes) -> Decimal:
 @from_bytes.register(UnknownType)
 def _(type_: UnknownType, buf: bytes) -> None:
     return None
+
+
+@from_bytes.register(VariantType)
+def _(type_: VariantType, buf: bytes) -> None:
+    """Raise, since the spec does not define a single-value binary serialization for variant."""
+    raise ValueError("Variant values have no single-value binary serialization")
 
 
 @singledispatch  # type: ignore
@@ -534,6 +547,13 @@ def _(_: UnknownType, val: None) -> None:
     """Columns of type unknown always default to null, so only null has a JSON representation."""
     if val is not None:
         raise ValueError(f"Columns of type unknown must default to null, got: {val}")
+
+
+@to_json.register(VariantType)
+def _(_: VariantType, val: Any) -> None:
+    """Variant columns must default to null, so the only JSON single value is null."""
+    if val is not None:
+        raise ValueError(f"Variant columns must default to null, got: {val!r}")
     return None
 
 
@@ -717,6 +737,13 @@ def _(_: UnknownType, val: None) -> None:
     """Columns of type unknown always default to null, so only null has a JSON representation."""
     if val is not None:
         raise ValueError(f"Columns of type unknown must default to null, got: {val}")
+
+
+@from_json.register(VariantType)
+def _(_: VariantType, val: Any) -> None:
+    """Variant columns must default to null, so the only JSON single value is null."""
+    if val is not None:
+        raise ValueError(f"Variant columns must default to null, got: {val!r}")
     return None
 
 

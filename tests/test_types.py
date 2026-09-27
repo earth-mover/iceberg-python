@@ -48,6 +48,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
     _parse_geography_type,
     _parse_geometry_type,
     strtobool,
@@ -67,6 +68,7 @@ non_parameterized_types = [
     (10, StringType),
     (11, UUIDType),
     (12, BinaryType),
+    (13, VariantType),
 ]
 
 primitive_types = {
@@ -82,6 +84,7 @@ primitive_types = {
     "string": StringType,
     "uuid": UUIDType,
     "binary": BinaryType,
+    "variant": VariantType,
 }
 
 
@@ -1023,3 +1026,23 @@ def test_decimal_scale_validation() -> None:
 
     with pytest.raises(ValidationError, match="Decimal scale must be between 0 and the precision"):
         DecimalType(5, 10)
+
+
+def test_variant_type() -> None:
+    assert VariantType() is VariantType()
+    assert str(VariantType()) == "variant"
+    assert repr(VariantType()) == "VariantType()"
+    assert VariantType().is_primitive
+    assert VariantType().minimum_format_version() == 3
+    field = NestedField.model_validate_json('{"id": 1, "name": "v", "type": "variant", "required": false}')
+    assert field.field_type == VariantType()
+    assert '"type":"variant"' in field.model_dump_json()
+
+
+def test_variant_type_requires_format_version_3() -> None:
+    from pyiceberg.schema import Schema
+
+    schema = Schema(NestedField(1, "v", VariantType(), required=False))
+    schema.check_format_version_compatibility(3)
+    with pytest.raises(ValueError, match="variant is only supported in 3 or higher"):
+        schema.check_format_version_compatibility(2)
