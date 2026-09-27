@@ -1,6 +1,6 @@
 # Geospatial Types
 
-PyIceberg supports Iceberg v3 geospatial primitive types: `geometry` and `geography`.
+PyIceberg models the Iceberg v3 geospatial primitive types `geometry` and `geography`. Support is a work in progress; the [format version 3](format-version-3.md) page lists what works today.
 
 ## Overview
 
@@ -89,6 +89,10 @@ point_wkb = bytes.fromhex("0101000000000000000000000000000000000000")
 3. **Bounds Metrics**: Geometry/geography columns do not currently contribute to data file bounds metrics.
 
 4. **Without geoarrow-pyarrow**: When the `geoarrow-pyarrow` package is not installed, geometry and geography columns are stored as binary without GeoArrow extension type metadata. The Iceberg schema preserves type information, but other tools reading the Parquet files directly may not recognize them as spatial types. Install with `pip install pyiceberg[geoarrow]` for full GeoArrow support.
+
+5. **Writing**: Writing to format version 3 tables, and therefore writing geometry or geography data, is not yet supported (see [format version 3](format-version-3.md)).
+
+6. **Parameterized types from other engines**: The spec serialization `geometry(srid:3857)` written by the Java implementation is not yet parsed; only the default CRS form loads.
 
 ## Format Version
 
