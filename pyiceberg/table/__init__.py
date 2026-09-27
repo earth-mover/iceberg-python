@@ -47,11 +47,13 @@ from pyiceberg.io import FileIO, load_file_io
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestEntry, ManifestEntryStatus, ManifestFile
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, UNPARTITIONED_PARTITION_SPEC, PartitionKey, PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.table.delete_file import DeleteFileSet
 from pyiceberg.table.delete_file_index import DeleteFileIndex
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
 from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata
+from pyiceberg.table.metadata_columns import is_metadata_column, project_schema
 from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import (
@@ -2211,10 +2213,7 @@ class TableScan(BaseScan):
             else:
                 raise ValueError(f"Snapshot not found: {self.snapshot_id}")
 
-        if "*" in self.selected_fields:
-            return current_schema
-
-        return current_schema.select(*self.selected_fields, case_sensitive=self.case_sensitive)
+        return project_schema(current_schema, self.selected_fields, case_sensitive=self.case_sensitive)
 
     def use_ref(self: S, name: str) -> S:
         if self.snapshot_id is not None:
@@ -2237,18 +2236,22 @@ class FileScanTask(ScanTask):
     """Task representing a data file and its corresponding delete files."""
 
     file: DataFile
-    delete_files: set[DataFile]
+    delete_files: DeleteFileSet
     residual: BooleanExpression
+    sequence_number: int | None
 
     def __init__(
         self,
         data_file: DataFile,
-        delete_files: set[DataFile] | None = None,
+        delete_files: Iterable[DataFile] | None = None,
         residual: BooleanExpression = ALWAYS_TRUE,
+        sequence_number: int | None = None,
     ) -> None:
         self.file = data_file
-        self.delete_files = delete_files or set()
+        self.delete_files = DeleteFileSet(delete_files if delete_files is not None else [])
         self.residual = residual
+        # The data sequence number of the manifest entry, used to derive _last_updated_sequence_number
+        self.sequence_number = sequence_number
 
     @staticmethod
     def from_rest_response(
@@ -2271,7 +2274,7 @@ class FileScanTask(ScanTask):
 
         data_file = _rest_file_to_data_file(rest_task.data_file)
 
-        resolved_deletes: set[DataFile] = set()
+        resolved_deletes = DeleteFileSet()
         if rest_task.delete_file_references:
             for idx in rest_task.delete_file_references:
                 delete_file = delete_files[idx]
@@ -2444,9 +2447,11 @@ class DataScan(TableScan):
         if self.table_identifier is None:
             raise ValueError("REST scan planning requires a table identifier")
 
+        # Metadata columns are materialized client-side while reading the data files
+        select = [name for name in self.selected_fields if not is_metadata_column(name, self.case_sensitive)]
         request = PlanTableScanRequest(
             snapshot_id=self.snapshot_id,
-            select=list(self.selected_fields) if self.selected_fields != ("*",) else None,
+            select=None if "*" in select else select,
             filter=self.row_filter if self.row_filter != ALWAYS_TRUE else None,
             case_sensitive=self.case_sensitive,
         )
@@ -2624,10 +2629,7 @@ class IncrementalAppendScan(BaseScan):
         return self.update(to_snapshot_id=to_snapshot_id)
 
     def projection(self) -> Schema:
-        current_schema = self.table_metadata.schema()
-        if "*" in self.selected_fields:
-            return current_schema
-        return current_schema.select(*self.selected_fields, case_sensitive=self.case_sensitive)
+        return project_schema(self.table_metadata.schema(), self.selected_fields, case_sensitive=self.case_sensitive)
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plans the relevant files added between the specified snapshots."""
@@ -2845,6 +2847,7 @@ class ManifestGroupPlanner:
                 residual=residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
                     data_entry.data_file.partition
                 ),
+                sequence_number=data_entry.sequence_number,
             )
             for data_entry in data_entries
         ]

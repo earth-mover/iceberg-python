@@ -79,6 +79,27 @@ def test_inspect_entries_and_files_render_null_bound(catalog: InMemoryCatalog) -
     assert files_metrics["upper_bound"] is None
 
 
+def test_inspect_files_and_entries_expose_v3_content_file_fields(catalog: InMemoryCatalog) -> None:
+    schema = Schema(NestedField(1, "s", StringType(), required=False))
+    tbl = catalog.create_table("default.v3_fields", schema)
+    tbl.append(pa.table({"s": ["a"]}, schema=pa.schema([pa.field("s", pa.large_string(), nullable=True)])))
+
+    v3_fields = ["first_row_id", "referenced_data_file", "content_offset", "content_size_in_bytes"]
+    for files in (tbl.inspect.files(), tbl.inspect.data_files(), tbl.inspect.delete_files(), tbl.inspect.all_files()):
+        names = files.column_names
+        # Matches the column order of Spark's files metadata tables
+        assert names[names.index("sort_order_id") + 1 : names.index("readable_metrics")] == v3_fields
+        assert files.schema.field("first_row_id").type == pa.int64()
+        assert files.schema.field("referenced_data_file").type == pa.string()
+
+    row = tbl.inspect.files().to_pylist()[0]
+    assert {field: row[field] for field in v3_fields} == dict.fromkeys(v3_fields)
+
+    data_file_type = tbl.inspect.entries().schema.field("data_file").type
+    data_file_names = [data_file_type.field(i).name for i in range(data_file_type.num_fields)]
+    assert data_file_names[data_file_names.index("sort_order_id") + 1 :] == v3_fields
+
+
 @pytest.mark.parametrize("newest_first", [False, True])
 def test_partitions_last_updated_uses_latest_snapshot_regardless_of_order(newest_first: bool) -> None:
     # Manifest entries are visited in manifest order, which is not chronological, so the

@@ -238,12 +238,12 @@ def test_v3_deletion_vectors_match_spark(session_catalog: Catalog, spark: "Spark
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="_row_id / _last_updated_sequence_number metadata columns are not implemented")
-def test_v3_row_lineage_columns_match_spark(session_catalog: Catalog, spark: "SparkSession") -> None:  # type: ignore[name-defined] # noqa: F821
-    table = session_catalog.load_table("default.test_positional_mor_deletes_v3")
-    spark_rows = spark.sql(
-        "SELECT number, _row_id, _last_updated_sequence_number FROM rest.default.test_positional_mor_deletes_v3"
-    ).collect()
+@pytest.mark.parametrize(
+    "identifier", ["default.test_positional_mor_deletes_v3", "default.test_positional_mor_double_deletes_v3"]
+)
+def test_v3_row_lineage_columns_match_spark(session_catalog: Catalog, spark: "SparkSession", identifier: str) -> None:  # type: ignore[name-defined] # noqa: F821
+    table = session_catalog.load_table(identifier)
+    spark_rows = spark.sql(f"SELECT number, _row_id, _last_updated_sequence_number FROM rest.{identifier}").collect()
     expected = {r["number"]: (r["_row_id"], r["_last_updated_sequence_number"]) for r in spark_rows}
     scan = table.scan(selected_fields=("number", "_row_id", "_last_updated_sequence_number"))
     got = {r["number"]: (r["_row_id"], r["_last_updated_sequence_number"]) for r in scan.to_arrow().to_pylist()}
@@ -263,7 +263,6 @@ def test_v3_first_row_id_inherited(session_catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="inspect tables do not expose the v3 data file fields")
 def test_v3_inspect_exposes_v3_fields(session_catalog: Catalog) -> None:
     table = session_catalog.load_table("default.test_positional_mor_deletes_v3")
     delete_files = table.inspect.delete_files().to_pylist()

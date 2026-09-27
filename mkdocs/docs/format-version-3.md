@@ -25,6 +25,9 @@ row lineage, deletion vectors, multi-argument transforms, and table encryption. 
 supports today. The table is kept in sync with the code; a feature listed as unsupported raises a clear error rather
 than silently producing incompatible files.
 
+The `files`, `data_files`, `delete_files`, `entries` and `all_*` inspect tables include the v3 content file fields
+`first_row_id`, `referenced_data_file`, `content_offset` and `content_size_in_bytes`.
+
 ## Support matrix
 
 | Feature | Read | Write | Notes |
@@ -32,8 +35,8 @@ than silently producing incompatible files.
 | v3 table metadata (`next-row-id`, `encryption-keys`) | Yes | Yes | v3 tables can be created on every catalog. `next-row-id` starts at 0. |
 | Upgrade a table from v1 or v2 to v3 | n/a | Yes | `upgrade_table_version(3)` sets `next-row-id` to 0 and leaves existing snapshots untouched. |
 | Manifests and manifest lists | Yes | Yes | Data and delete manifests; manifest lists assign `first-row-id` to data manifests. |
-| Row lineage (`_row_id`, `_last_updated_sequence_number`) | No | Yes | Commits set the snapshot `first-row-id` and `added-rows` and advance `next-row-id`, so engines such as Spark read spec-correct row ids. The `_row_id` and `_last_updated_sequence_number` columns cannot be read with PyIceberg yet. |
-| Deletion vectors (Puffin) | Yes | No | Read support decodes every blob in the file. Deletes on v3 tables are copy-on-write. |
+| Row lineage (`_row_id`, `_last_updated_sequence_number`) | Yes | Yes | Data files inherit `first_row_id` from their manifest, and both columns can be requested in `selected_fields` (see [Row lineage metadata columns](api.md#row-lineage-metadata-columns)). Commits set the snapshot `first-row-id` and `added-rows` and advance `next-row-id`. |
+| Deletion vectors (Puffin) | Yes | No | Only the blob range named by `content_offset` / `content_size_in_bytes` is read, and the blob length, magic, CRC-32 and cardinality are validated. A DV applies only to its `referenced_data_file` and replaces older position deletes for that file. Deletes on v3 tables are copy-on-write. |
 | Position delete files (v2 style) | Yes | No | |
 | Equality deletes | No | No | |
 | `timestamp_ns` / `timestamptz_ns` | Yes | No | Values are read with nanosecond precision. Row filters and partition pruning work on nanosecond columns. |

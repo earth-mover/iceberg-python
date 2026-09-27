@@ -676,7 +676,7 @@ status: int8 not null
 snapshot_id: int64 not null
 sequence_number: int64 not null
 file_sequence_number: int64 not null
-data_file: struct<content: int8 not null, file_path: string not null, file_format: string not null, partition: struct<> not null, record_count: int64 not null, file_size_in_bytes: int64 not null, column_sizes: map<int32, int64>, value_counts: map<int32, int64>, null_value_counts: map<int32, int64>, nan_value_counts: map<int32, int64>, lower_bounds: map<int32, binary>, upper_bounds: map<int32, binary>, key_metadata: binary, split_offsets: list<item: int64>, equality_ids: list<item: int32>, sort_order_id: int32> not null
+data_file: struct<content: int8 not null, file_path: string not null, file_format: string not null, partition: struct<> not null, record_count: int64 not null, file_size_in_bytes: int64 not null, column_sizes: map<int32, int64>, value_counts: map<int32, int64>, null_value_counts: map<int32, int64>, nan_value_counts: map<int32, int64>, lower_bounds: map<int32, binary>, upper_bounds: map<int32, binary>, key_metadata: binary, split_offsets: list<item: int64>, equality_ids: list<item: int32>, sort_order_id: int32, first_row_id: int64, referenced_data_file: string, content_offset: int64, content_size_in_bytes: int64> not null
   child 0, content: int8 not null
   child 1, file_path: string not null
   child 2, file_format: string not null
@@ -713,6 +713,10 @@ data_file: struct<content: int8 not null, file_path: string not null, file_forma
   child 14, equality_ids: list<item: int32>
       child 0, item: int32
   child 15, sort_order_id: int32
+  child 16, first_row_id: int64
+  child 17, referenced_data_file: string
+  child 18, content_offset: int64
+  child 19, content_size_in_bytes: int64
 readable_metrics: struct<city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string> not null, lat: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null, long: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null>
   child 0, city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string> not null
       child 0, column_size: int64
@@ -985,6 +989,10 @@ split_offsets: list<item: int64>
 equality_ids: list<item: int32>
   child 0, item: int32
 sort_order_id: int32
+first_row_id: int64
+referenced_data_file: string
+content_offset: int64
+content_size_in_bytes: int64
 readable_metrics: struct<city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: large_string, upper_bound: large_string> not null, lat: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null, long: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null>
   child 0, city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string> not null
       child 0, column_size: int64
@@ -1813,6 +1821,22 @@ The low level API `plan_files` methods returns a set of tasks that provide the f
 ```
 
 In this case it is up to the engine itself to filter the file itself. Below, `to_arrow()` and `to_duckdb()` that already do this for you.
+
+### Row lineage metadata columns
+
+On format version 3 tables, the reserved row lineage columns `_row_id` and `_last_updated_sequence_number` can be
+requested in `selected_fields`. They are not part of the table schema, and are appended after the table columns in the
+order they are requested:
+
+```python
+scan = table.scan(selected_fields=("VendorID", "_row_id", "_last_updated_sequence_number"))
+scan.to_arrow()
+```
+
+A row without a stored value inherits `_row_id` from its data file's `first_row_id` plus the row's position in the file,
+and `_last_updated_sequence_number` from the data sequence number of the file. Both are null for rows in data files
+added before row lineage was enabled. The columns are read-only: appending a dataframe that contains them is rejected by
+the schema compatibility check.
 
 ### Apache Arrow
 

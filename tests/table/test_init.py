@@ -45,6 +45,7 @@ from pyiceberg.table import (
     TableIdentifier,
 )
 from pyiceberg.table.metadata import TableMetadataUtil, TableMetadataV1, TableMetadataV2, _generate_snapshot_id
+from pyiceberg.table.metadata_columns import LAST_UPDATED_SEQUENCE_NUMBER, ROW_ID
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     MetadataLogEntry,
@@ -366,6 +367,26 @@ def test_table_scan_projection_unknown_column(table_v2: Table) -> None:
         _ = scan.select("a").projection()
 
     assert "Could not find column: 'a'" in str(exc_info.value)
+
+
+def test_table_scan_projection_metadata_columns(table_v2: Table) -> None:
+    projection_schema = table_v2.scan(selected_fields=("_last_updated_sequence_number", "y", "_row_id")).projection()
+    assert projection_schema == Schema(
+        NestedField(field_id=2, name="y", field_type=LongType(), required=True, doc="comment"),
+        LAST_UPDATED_SEQUENCE_NUMBER,
+        ROW_ID,
+        identifier_field_ids=[2],
+    )
+    assert projection_schema.schema_id == 1
+
+    full_projection = table_v2.scan(selected_fields=("*", "_row_id")).projection()
+    assert full_projection.column_names == ["x", "y", "z", "_row_id"]
+
+    case_insensitive = table_v2.scan(selected_fields=("x", "_ROW_ID"), case_sensitive=False).projection()
+    assert case_insensitive.column_names == ["x", "_row_id"]
+
+    only_metadata = table_v2.scan().select("_row_id").projection()
+    assert only_metadata.column_names == ["_row_id"]
 
 
 def test_data_scan_plan_files_no_current_snapshot(example_table_metadata_no_snapshot_v1: dict[str, Any]) -> None:
@@ -2188,3 +2209,24 @@ def test_static_table_forwards_location_to_table_file_io(metadata_location: str,
 
     assert seen_locations, "expected at least one load_file_io call"
     assert all(loc is not None for loc in seen_locations), f"load_file_io called without a location: {seen_locations}"
+
+
+def test_metadata_columns_are_read_but_never_written(catalog: Catalog) -> None:
+    import pyarrow as pa
+
+    from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+    catalog.create_namespace("default")
+    schema = Schema(NestedField(1, "id", LongType(), required=False))
+    table = catalog.create_table("default.metadata_columns", schema=schema)
+    table.append(pa.Table.from_pylist([{"id": 1}, {"id": 2}], schema=schema_to_pyarrow(schema)))
+
+    result = table.scan(selected_fields=("id", "_row_id", "_last_updated_sequence_number")).to_arrow()
+    assert result.column_names == ["id", "_row_id", "_last_updated_sequence_number"]
+    # Data files added without a first_row_id do not carry row lineage
+    assert result.column("_row_id").to_pylist() == [None, None]
+    assert result.column("_last_updated_sequence_number").to_pylist() == [None, None]
+
+    with pytest.raises(ValueError, match="PyArrow table contains more columns: _last_updated_sequence_number, _row_id"):
+        table.append(result)
+    assert len(table.scan().to_arrow()) == 2

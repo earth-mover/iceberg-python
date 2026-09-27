@@ -148,11 +148,12 @@ from pyiceberg.schema import (
     visit_with_partner,
 )
 from pyiceberg.table import DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE, TableProperties
-from pyiceberg.table.deletion_vector import deletion_vectors_from_puffin_file
+from pyiceberg.table.delete_file import DeleteFileSet
+from pyiceberg.table.deletion_vector import read_deletion_vectors
 from pyiceberg.table.locations import load_location_provider
 from pyiceberg.table.metadata import TableMetadata
+from pyiceberg.table.metadata_columns import LAST_UPDATED_SEQUENCE_NUMBER, ROW_ID
 from pyiceberg.table.name_mapping import NameMapping, apply_name_mapping
-from pyiceberg.table.puffin import PuffinFile
 from pyiceberg.transforms import IdentityTransform, TruncateTransform
 from pyiceberg.typedef import EMPTY_DICT, Properties, Record, TableVersion
 from pyiceberg.types import (
@@ -1199,10 +1200,7 @@ def _read_deletes(io: FileIO, data_file: DataFile) -> dict[str, pa.ChunkedArray]
                 for path in table.column("file_path").unique()
             }
     elif data_file.file_format == FileFormat.PUFFIN:
-        with io.new_input(data_file.file_path).open() as fi:
-            payload = fi.read()
-
-        return {dv.referenced_data_file: dv.to_vector() for dv in deletion_vectors_from_puffin_file(PuffinFile(payload))}
+        return {dv.referenced_data_file: dv.to_vector() for dv in read_deletion_vectors(io, data_file)}
     else:
         raise ValueError(f"Delete file format not supported: {data_file.file_format}")
 
@@ -1679,6 +1677,10 @@ def _get_column_projection_values(
     return projected_missing_fields
 
 
+# Temporary column holding each row's position in the data file while filters are applied
+_ROW_POSITION_COLUMN = "__pyiceberg_row_position"
+
+
 def _task_to_record_batches(
     io: FileIO,
     task: FileScanTask,
@@ -1727,12 +1729,16 @@ def _task_to_record_batches(
 
         file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
 
+        # Row lineage columns are derived from the position of each row in the file
+        track_positions = ROW_ID.field_id in projected_schema.field_ids
+        apply_filter_after_read = bool(positional_deletes) or track_positions
+
         fragment_scanner = ds.Scanner.from_fragment(
             fragment=fragment,
             schema=physical_schema,
             # This will push down the query to Arrow.
-            # But in case there are positional deletes, we have to apply them first
-            filter=pyarrow_filter if not positional_deletes else None,
+            # But in case there are positional deletes or row positions are needed, we have to apply them first
+            filter=pyarrow_filter if not apply_filter_after_read else None,
             columns=[col.name for col in file_project_schema.columns],
         )
 
@@ -1742,27 +1748,36 @@ def _task_to_record_batches(
             next_index = next_index + len(batch)
             current_index = next_index - len(batch)
             current_batch = batch
+            positions = _row_positions(current_index, next_index) if track_positions else None
 
             if positional_deletes:
                 # Create the mask of indices that we're interested in
                 indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
                 current_batch = current_batch.take(indices)
-                if pyarrow_filter is not None:
-                    # Temporary fix until PyArrow 21 is the minimum supported version
-                    # (https://github.com/apache/arrow/pull/46057): RecordBatch.filter raises
-                    # IndexError on PyArrow <21 when the result is empty; Table.filter does not.
-                    table = pa.Table.from_batches([current_batch])
-                    table = table.filter(pyarrow_filter)
-                    if table.num_rows == 0:
-                        current_batch = current_batch.slice(0, 0)
-                    else:
-                        current_batch = table.combine_chunks().to_batches()[0]
+                if positions is not None:
+                    positions = positions.take(indices)
+
+            if apply_filter_after_read and pyarrow_filter is not None:
+                if positions is not None:
+                    current_batch = current_batch.append_column(_ROW_POSITION_COLUMN, positions)
+                # Temporary fix until PyArrow 21 is the minimum supported version
+                # (https://github.com/apache/arrow/pull/46057): RecordBatch.filter raises
+                # IndexError on PyArrow <21 when the result is empty; Table.filter does not.
+                table = pa.Table.from_batches([current_batch])
+                table = table.filter(pyarrow_filter)
+                if table.num_rows == 0:
+                    current_batch = current_batch.slice(0, 0)
+                else:
+                    current_batch = table.combine_chunks().to_batches()[0]
+                if positions is not None:
+                    positions = current_batch.column(_ROW_POSITION_COLUMN)
+                    current_batch = current_batch.drop_columns([_ROW_POSITION_COLUMN])
 
             # skip empty batches
             if current_batch.num_rows == 0:
                 continue
 
-            yield _to_requested_schema(
+            result_batch = _to_requested_schema(
                 projected_schema,
                 file_project_schema,
                 current_batch,
@@ -1770,19 +1785,64 @@ def _task_to_record_batches(
                 projected_missing_fields=projected_missing_fields,
                 allow_timestamp_tz_mismatch=True,
             )
+            yield _inherit_row_lineage(result_batch, projected_schema, task, positions)
+
+
+def _row_positions(start: int, stop: int) -> pa.Array:
+    """Return the int64 positions ``start`` (inclusive) to ``stop`` (exclusive)."""
+    return pc.add(pc.cumulative_sum(pa.repeat(pa.scalar(1, pa.int64()), stop - start)), pa.scalar(start - 1, pa.int64()))
+
+
+def _inherit_row_lineage(
+    batch: pa.RecordBatch, projected_schema: Schema, task: FileScanTask, positions: pa.Array | None
+) -> pa.RecordBatch:
+    """Fill null row lineage metadata columns from the data file's first row ID and data sequence number.
+
+    Rows keep values that are stored in the data file. Files added before row lineage was enabled have no
+    first_row_id, and both columns stay null for them.
+    """
+    first_row_id = task.file.first_row_id
+    for index, field in enumerate(projected_schema.fields):
+        if field.field_id == ROW_ID.field_id:
+            inherited = (
+                None if first_row_id is None or positions is None else pc.add(positions, pa.scalar(first_row_id, pa.int64()))
+            )
+        elif field.field_id == LAST_UPDATED_SEQUENCE_NUMBER.field_id:
+            inherited = (
+                None
+                if first_row_id is None or task.sequence_number is None
+                else pa.repeat(pa.scalar(task.sequence_number, pa.int64()), batch.num_rows)
+            )
+        else:
+            continue
+
+        if inherited is not None:
+            column = batch.column(index)
+            values = inherited if column.null_count == len(column) else pc.coalesce(column, inherited)
+            batch = batch.set_column(index, batch.schema.field(index), values.cast(column.type))
+
+    return batch
 
 
 def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[str, list[ChunkedArray]]:
     deletes_per_file: dict[str, list[ChunkedArray]] = {}
-    unique_deletes = set(itertools.chain.from_iterable([task.delete_files for task in tasks]))
+    # A delete file can hold positions for several data files, but it only applies to the data files
+    # it was planned for (for example, a DV supersedes older position deletes for its data file)
+    planned_deletes: dict[str, DeleteFileSet] = {}
+    for task in tasks:
+        planned_deletes.setdefault(task.file.file_path, DeleteFileSet()).update(task.delete_files)
+    unique_deletes = DeleteFileSet(itertools.chain.from_iterable(planned_deletes.values()))
     if len(unique_deletes) > 0:
         executor = ExecutorFactory.get_or_create()
+        delete_files = list(unique_deletes)
         deletes_per_files: Iterator[dict[str, ChunkedArray]] = executor.map(
             lambda args: _read_deletes(*args),
-            [(io, delete_file) for delete_file in unique_deletes],
+            [(io, delete_file) for delete_file in delete_files],
         )
-        for delete in deletes_per_files:
+        for delete_file, delete in zip(delete_files, deletes_per_files, strict=True):
             for file, arr in delete.items():
+                if delete_file not in planned_deletes.get(file, ()):
+                    continue
                 if file in deletes_per_file:
                     deletes_per_file[file].append(arr)
                 else:

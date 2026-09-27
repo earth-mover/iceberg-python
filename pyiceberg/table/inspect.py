@@ -238,6 +238,10 @@ class InspectTable:
                             pa.field("split_offsets", pa.list_(pa.int64()), nullable=True),
                             pa.field("equality_ids", pa.list_(pa.int32()), nullable=True),
                             pa.field("sort_order_id", pa.int32(), nullable=True),
+                            pa.field("first_row_id", pa.int64(), nullable=True),
+                            pa.field("referenced_data_file", pa.string(), nullable=True),
+                            pa.field("content_offset", pa.int64(), nullable=True),
+                            pa.field("content_size_in_bytes", pa.int64(), nullable=True),
                         ]
                     ),
                     nullable=False,
@@ -288,7 +292,7 @@ class InspectTable:
                             "partition": partition_record_dict,
                             "record_count": entry.data_file.record_count,
                             "file_size_in_bytes": entry.data_file.file_size_in_bytes,
-                            "column_sizes": dict(entry.data_file.column_sizes),
+                            "column_sizes": dict(entry.data_file.column_sizes or {}),
                             "value_counts": dict(entry.data_file.value_counts or {}),
                             "null_value_counts": dict(entry.data_file.null_value_counts or {}),
                             "nan_value_counts": dict(entry.data_file.nan_value_counts or {}),
@@ -298,6 +302,10 @@ class InspectTable:
                             "split_offsets": entry.data_file.split_offsets,
                             "equality_ids": entry.data_file.equality_ids,
                             "sort_order_id": entry.data_file.sort_order_id,
+                            "first_row_id": entry.data_file.first_row_id,
+                            "referenced_data_file": entry.data_file.referenced_data_file,
+                            "content_offset": entry.data_file.content_offset,
+                            "content_size_in_bytes": entry.data_file.content_size_in_bytes,
                             "spec_id": entry.data_file.spec_id,
                         },
                         "readable_metrics": readable_metrics,
@@ -799,6 +807,10 @@ class InspectTable:
                     "split_offsets": data_file.split_offsets,
                     "equality_ids": data_file.equality_ids,
                     "sort_order_id": data_file.sort_order_id,
+                    "first_row_id": data_file.first_row_id,
+                    "referenced_data_file": data_file.referenced_data_file,
+                    "content_offset": data_file.content_offset,
+                    "content_size_in_bytes": data_file.content_size_in_bytes,
                     "readable_metrics": readable_metrics,
                 }
             )
@@ -819,7 +831,9 @@ class InspectTable:
                 ``file_size_in_bytes``, ``column_sizes``, ``value_counts``,
                 ``null_value_counts``, ``nan_value_counts``, ``lower_bounds``,
                 ``upper_bounds``, ``key_metadata``, ``split_offsets``,
-                ``equality_ids``, ``sort_order_id``, and ``readable_metrics``.
+                ``equality_ids``, ``sort_order_id``, ``first_row_id``,
+                ``referenced_data_file``, ``content_offset``,
+                ``content_size_in_bytes``, and ``readable_metrics``.
         """
         import pyarrow as pa
 
@@ -868,6 +882,10 @@ class InspectTable:
                 pa.field("split_offsets", pa.list_(pa.int64()), nullable=True),
                 pa.field("equality_ids", pa.list_(pa.int32()), nullable=True),
                 pa.field("sort_order_id", pa.int32(), nullable=True),
+                pa.field("first_row_id", pa.int64(), nullable=True),
+                pa.field("referenced_data_file", pa.string(), nullable=True),
+                pa.field("content_offset", pa.int64(), nullable=True),
+                pa.field("content_size_in_bytes", pa.int64(), nullable=True),
                 pa.field("readable_metrics", pa.struct(readable_metrics_struct), nullable=True),
             ]
         )
