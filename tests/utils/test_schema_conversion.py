@@ -371,6 +371,24 @@ def test_timestamp_nanos_avro_roundtrip() -> None:
     assert AvroSchemaConversion().avro_to_iceberg(avro_schema) == schema
 
 
+def test_iceberg_to_avro_defaults() -> None:
+    schema = Schema(
+        NestedField(1, "d", DateType(), required=True, write_default=19052),
+        NestedField(2, "b", BinaryType(), required=False, write_default=b"\xff"),
+        NestedField(3, "u", UnknownType(), required=False),
+    )
+    avro_schema = AvroSchemaConversion().iceberg_to_avro(schema)
+    assert isinstance(avro_schema, dict)
+    fields = {field["name"]: field for field in avro_schema["fields"]}
+    # Required fields carry the default in the Avro encoding of the type
+    assert fields["d"]["default"] == 19052
+    # The default of a nullable union must match its first branch, null
+    assert (fields["b"]["type"], fields["b"]["default"]) == (["null", "bytes"], None)
+    # A column of type unknown is written as a plain null instead of an invalid union of nulls
+    assert (fields["u"]["type"], fields["u"]["default"]) == ("null", None)
+    assert AvroSchemaConversion().avro_to_iceberg(avro_schema).find_field("u") == NestedField(3, "u", UnknownType())
+
+
 def test_unknown_logical_type() -> None:
     """Test raising a ValueError when converting an unknown logical type as part of an Avro schema conversion"""
     avro_logical_type = {"type": "bytes", "logicalType": "date"}

@@ -527,9 +527,19 @@ class NestedField(IcebergType):
 
         return f"NestedField({', '.join(parts)})"
 
-    def __getnewargs__(self) -> tuple[int, str, IcebergType, bool, str | None]:
+    @model_validator(mode="after")
+    def check_null_only_types(self) -> NestedField:
+        """Validate that columns of the types that must default to null are optional and have no defaults."""
+        if isinstance(self.field_type, (UnknownType, GeometryType, GeographyType)):
+            if self.initial_default is not None or self.write_default is not None:
+                raise ValueError(f"Columns of type {self.field_type} must default to null: {self.name}")
+        if isinstance(self.field_type, UnknownType) and self.required:
+            raise ValueError(f"Columns of type {self.field_type} must be optional: {self.name}")
+        return self
+
+    def __getnewargs__(self) -> tuple[int, str, IcebergType, bool, str | None, Any, Any]:
         """Pickle the NestedField class."""
-        return (self.field_id, self.name, self.field_type, self.required, self.doc)
+        return (self.field_id, self.name, self.field_type, self.required, self.doc, self.initial_default, self.write_default)
 
     @property
     def optional(self) -> bool:

@@ -529,6 +529,14 @@ def _(_: UUIDType, val: uuid.UUID) -> str:
     return str(val)
 
 
+@to_json.register(UnknownType)
+def _(_: UnknownType, val: None) -> None:
+    """Columns of type unknown always default to null, so only null has a JSON representation."""
+    if val is not None:
+        raise ValueError(f"Columns of type unknown must default to null, got: {val}")
+    return None
+
+
 @to_json.register(GeometryType)
 def _(_: GeometryType, val: bytes) -> str:
     """Serialize geometry to WKT string per Iceberg spec.
@@ -704,9 +712,19 @@ def _(_: UUIDType, val: str | bytes | uuid.UUID) -> uuid.UUID:
         return val
 
 
+@from_json.register(UnknownType)
+def _(_: UnknownType, val: None) -> None:
+    """Columns of type unknown always default to null, so only null has a JSON representation."""
+    if val is not None:
+        raise ValueError(f"Columns of type unknown must default to null, got: {val}")
+    return None
+
+
 @from_json.register(GeometryType)
-def _(_: GeometryType, val: str | bytes) -> bytes:
+def _(_: GeometryType, val: str | bytes | None) -> bytes | None:
     """Convert JSON WKT string into WKB bytes per Iceberg spec.
+
+    Geometry columns must default to null, so a null value is returned as-is.
 
     Note: This requires WKT to WKB conversion which is not yet implemented.
     The Iceberg spec requires geometry values to be represented as WKT strings
@@ -715,7 +733,7 @@ def _(_: GeometryType, val: str | bytes) -> bytes:
     Raises:
         NotImplementedError: WKT to WKB conversion is not yet supported.
     """
-    if isinstance(val, bytes):
+    if val is None or isinstance(val, bytes):
         # Already WKB bytes, return as-is
         return val
     raise NotImplementedError(
@@ -725,8 +743,10 @@ def _(_: GeometryType, val: str | bytes) -> bytes:
 
 
 @from_json.register(GeographyType)
-def _(_: GeographyType, val: str | bytes) -> bytes:
+def _(_: GeographyType, val: str | bytes | None) -> bytes | None:
     """Convert JSON WKT string into WKB bytes per Iceberg spec.
+
+    Geography columns must default to null, so a null value is returned as-is.
 
     Note: This requires WKT to WKB conversion which is not yet implemented.
     The Iceberg spec requires geography values to be represented as WKT strings
@@ -735,7 +755,7 @@ def _(_: GeographyType, val: str | bytes) -> bytes:
     Raises:
         NotImplementedError: WKT to WKB conversion is not yet supported.
     """
-    if isinstance(val, bytes):
+    if val is None or isinstance(val, bytes):
         # Already WKB bytes, return as-is
         return val
     raise NotImplementedError(

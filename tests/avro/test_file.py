@@ -15,15 +15,17 @@
 #  specific language governing permissions and limitations
 #  under the License.
 import inspect
+import json
 from _decimal import Decimal
 from datetime import datetime
 from enum import Enum
+from io import StringIO
 from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import UUID
 
 import pytest
-from fastavro import reader, writer
+from fastavro import json_writer, reader, writer
 
 import pyiceberg.avro.file as avro
 from pyiceberg.avro.codecs.deflate import DeflateCodec
@@ -41,6 +43,7 @@ from pyiceberg.manifest import (
 from pyiceberg.schema import Schema
 from pyiceberg.typedef import Record, TableVersion
 from pyiceberg.types import (
+    BinaryType,
     BooleanType,
     DateType,
     DecimalType,
@@ -50,7 +53,9 @@ from pyiceberg.types import (
     IntegerType,
     LongType,
     NestedField,
+    PrimitiveType,
     StringType,
+    TimestampNanoType,
     TimestampType,
     TimestamptzType,
     TimeType,
@@ -453,3 +458,54 @@ def test_all_primitive_types(is_required: bool) -> None:
     for idx, field in enumerate(all_primitives_schema.as_struct()):
         assert record[idx] == avro_entry[idx], f"Invalid {field}"
         assert record[idx] == avro_entry_read_with_fastavro[idx], f"Invalid {field} read with fastavro"
+
+
+@pytest.mark.parametrize(
+    "field_type, value",
+    [
+        (BooleanType(), True),
+        (IntegerType(), 34),
+        (LongType(), 429496729622),
+        (FloatType(), 1.5),
+        (DoubleType(), 2.25),
+        (StringType(), "blue"),
+        (BinaryType(), b"\x00\x7f\xff"),
+        (FixedType(3), b"\x00\x7f\xff"),
+        (DecimalType(6, 2), Decimal("-123.45")),
+        (DateType(), 19052),
+        (TimeType(), 69922000000),
+        (TimestampType(), 1677629965000000),
+        (TimestamptzType(), 1677629965000000),
+        (TimestampNanoType(), 1677629965000000001),
+        (UUIDType(), UUID("12345678-1234-5678-1234-567812345678")),
+    ],
+)
+def test_write_default_is_avro_default(field_type: PrimitiveType, value: Any) -> None:
+    """The Avro default of a field decodes to the same value as the written field."""
+    id_field = NestedField(field_id=1, name="id", field_type=IntegerType(), required=True)
+    value_field = NestedField(field_id=2, name="value", field_type=field_type, required=True)
+    without_value = Schema(id_field)
+    with_value = Schema(id_field, value_field)
+    with_default = Schema(
+        id_field, NestedField(field_id=2, name="value", field_type=field_type, required=True, write_default=value)
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        without_value_file, with_value_file = f"{tmpdir}/without_value.avro", f"{tmpdir}/with_value.avro"
+        with avro.AvroOutputFile[Record](PyArrowFileIO().new_output(without_value_file), without_value, "test") as out:
+            out.write_block([Record(1)])
+        with avro.AvroOutputFile[Record](PyArrowFileIO().new_output(with_value_file), with_value, "test") as out:
+            out.write_block([Record(1, value)])
+
+        with open(with_value_file, "rb") as fo:
+            (expected,) = list(reader(fo))
+
+        # Schema resolution fills the field that is missing from the file with the raw Avro default
+        reader_schema = AvroSchemaConversion().iceberg_to_avro(with_default, schema_name="test")
+        with open(without_value_file, "rb") as fo:
+            (actual,) = list(reader(fo, reader_schema=reader_schema))
+
+    # The Avro JSON encoding of the written value is the expected JSON default
+    encoded = StringIO()
+    json_writer(encoded, reader_schema, [expected])
+    assert actual == json.loads(encoded.getvalue())

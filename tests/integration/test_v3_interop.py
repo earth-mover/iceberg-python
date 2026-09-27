@@ -27,6 +27,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from pyiceberg.catalog import Catalog
@@ -39,10 +40,12 @@ from pyiceberg.types import (
     GeometryType,
     IntegerType,
     NestedField,
+    StringType,
     TimestampNanoType,
     TimestamptzNanoType,
     UnknownType,
 )
+from pyiceberg.utils.geo import GeospatialBound
 
 NS_VALUES = [1704067200123456789, 1706832000000000001, None]
 NS_PARTITIONS = [
@@ -410,3 +413,108 @@ def test_v3_upgrade_then_pyiceberg_append_read_by_spark(
     rows = spark.sql(f"SELECT id, _row_id FROM rest.{probe_identifier} ORDER BY id").collect()
     assert [r["id"] for r in rows] == [1, 2, 3]
     assert sorted(r["_row_id"] for r in rows) == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------- PyIceberg-written geo, defaults, unknown
+
+WKB_POINT_1_2 = bytes.fromhex("0101000000000000000000f03f0000000000000040")
+WKB_POINT_NEG_3_5 = bytes.fromhex("010100000000000000000008c00000000000001440")
+
+
+@pytest.mark.integration
+def test_v3_pyiceberg_geo_write_round_trip(session_catalog: Catalog, probe_identifier: str) -> None:
+    ga = pytest.importorskip("geoarrow.pyarrow")
+    # Spark 4.0 with Iceberg 1.11 cannot read geometry columns, so the files are verified through PyIceberg and Parquet
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "geom", GeometryType(), required=False),
+        NestedField(3, "geom_srid", GeometryType("srid:3857"), required=False),
+        NestedField(4, "geog", GeographyType(), required=False),
+    )
+    table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "3"})
+    id_field = pa.field("id", pa.int32(), nullable=False)
+    plain = pa.array([WKB_POINT_1_2, None], pa.binary())
+    plain_schema = pa.schema(
+        [id_field, pa.field("geom", pa.binary()), pa.field("geom_srid", pa.binary()), pa.field("geog", pa.binary())]
+    )
+    table.append(pa.Table.from_arrays([pa.array([1, 2], pa.int32()), plain, plain, plain], schema=plain_schema))
+
+    wkb = pa.array([WKB_POINT_1_2, WKB_POINT_NEG_3_5], pa.binary())
+    geo_arrays = [
+        pa.ExtensionArray.from_storage(ga.wkb(), wkb),
+        pa.ExtensionArray.from_storage(ga.wkb().with_crs("srid:3857"), wkb),
+        pa.ExtensionArray.from_storage(ga.wkb().with_edge_type(ga.EdgeType.SPHERICAL), wkb),
+    ]
+    geo_schema = pa.schema(
+        [id_field, *[pa.field(name, array.type) for name, array in zip(["geom", "geom_srid", "geog"], geo_arrays, strict=True)]]
+    )
+    table.append(pa.Table.from_arrays([pa.array([3, 4], pa.int32()), *geo_arrays], schema=geo_schema))
+
+    table = session_catalog.load_table(probe_identifier)
+    result = table.scan().to_arrow().sort_by("id")
+    for name in ("geom", "geom_srid", "geog"):
+        column = result.column(name)
+        assert column.cast(column.type.storage_type).to_pylist() == [WKB_POINT_1_2, None, WKB_POINT_1_2, WKB_POINT_NEG_3_5]
+
+    for task in table.scan().plan_files():
+        with table.io.new_input(task.file.file_path).open() as f:
+            parquet_schema = str(pq.ParquetFile(f).schema)
+        # The Parquet logical types carry the CRS; the default OGC:CRS84 is written as an empty CRS
+        assert "field_id=2 geom (Geometry(crs=))" in parquet_schema
+        assert "field_id=3 geom_srid (Geometry(crs=srid:3857))" in parquet_schema
+        assert "field_id=4 geog (Geography(crs=, algorithm=spherical))" in parquet_schema
+
+    bounds = [
+        (
+            GeospatialBound.from_bytes(row["readable_metrics"]["geom_srid"]["lower_bound"]),
+            GeospatialBound.from_bytes(row["readable_metrics"]["geom_srid"]["upper_bound"]),
+        )
+        for row in table.inspect.files().to_pylist()
+    ]
+    bounds.sort(key=lambda bound: bound[0].x)
+    assert bounds == [
+        (GeospatialBound(-3.0, 2.0), GeospatialBound(1.0, 5.0)),
+        (GeospatialBound(1.0, 2.0), GeospatialBound(1.0, 2.0)),
+    ]
+
+
+@pytest.mark.integration
+def test_v3_pyiceberg_write_default_read_by_spark(
+    session_catalog: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+    probe_identifier: str,
+) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "3"})
+    table.append(_ids([1]))
+    with table.update_schema() as update:
+        update.add_column("color", StringType(), default_value="blue")
+    with table.update_schema() as update:
+        update.set_default_value("color", "green")
+    # The dataframe does not have the column, so the write-default is written
+    table.append(_ids([2]))
+
+    table = session_catalog.load_table(probe_identifier)
+    assert [row["color"] for row in table.scan().to_arrow().sort_by("id").to_pylist()] == ["blue", "green"]
+    rows = spark.sql(f"SELECT id, color FROM rest.{probe_identifier} ORDER BY id").collect()
+    assert [(r["id"], r["color"]) for r in rows] == [(1, "blue"), (2, "green")]
+
+
+@pytest.mark.integration
+def test_v3_pyiceberg_unknown_column_append_read_by_spark(
+    session_catalog: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+    probe_identifier: str,
+) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True), NestedField(2, "unk", UnknownType(), required=False))
+    table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "3"})
+    table.append(_ids([1, 2]))
+
+    table = session_catalog.load_table(probe_identifier)
+    assert table.scan().to_arrow().sort_by("id").to_pylist() == [{"id": 1, "unk": None}, {"id": 2, "unk": None}]
+    (task,) = table.scan().plan_files()
+    with table.io.new_input(task.file.file_path).open() as f:
+        # Columns of type unknown are not stored in data files
+        assert pq.ParquetFile(f).schema_arrow.names == ["id"]
+    rows = spark.sql(f"SELECT id, unk FROM rest.{probe_identifier} ORDER BY id").collect()
+    assert [(r["id"], r["unk"]) for r in rows] == [(1, None), (2, None)]

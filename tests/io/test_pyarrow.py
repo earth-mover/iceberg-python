@@ -27,6 +27,7 @@ import zlib
 from collections.abc import Iterator
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -78,6 +79,7 @@ from pyiceberg.io.pyarrow import (
     ICEBERG_SCHEMA,
     PYARROW_PARQUET_FIELD_ID_KEY,
     ArrowScan,
+    GeospatialStatsAggregator,
     PyArrowFile,
     PyArrowFileIO,
     StatsAggregator,
@@ -101,7 +103,7 @@ from pyiceberg.io.pyarrow import (
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema, make_compatible_name, visit
-from pyiceberg.table import FileScanTask, TableProperties, WriteTask
+from pyiceberg.table import FileScanTask, Table, TableProperties, WriteTask
 from pyiceberg.table.deletion_vector import (
     _DV_BLOB_MAGIC_NUMBER,
     PROPERTY_REFERENCED_DATA_FILE,
@@ -136,7 +138,9 @@ from pyiceberg.types import (
     TimestamptzNanoType,
     TimestamptzType,
     TimeType,
+    UnknownType,
 )
+from pyiceberg.utils.geo import GeospatialBound
 from tests.catalog.test_base import InMemoryCatalog
 from tests.conftest import UNIFIED_AWS_SESSION_PROPERTIES
 
@@ -1273,6 +1277,194 @@ def test_projection_geo_filter_on_other_column(tmp_path: Path) -> None:
     geom = result.column("geom")
     storage = geom.cast(geom.type.storage_type) if isinstance(geom.type, pa.ExtensionType) else geom
     assert storage.to_pylist() == [None, WKB_POINT_3_4]
+
+
+def _v3_table(tmp_path: Path, schema: Schema, name: str = "tbl") -> Table:
+    from pyiceberg.catalog.memory import InMemoryCatalog as MemoryCatalog
+
+    memory_catalog = MemoryCatalog("memory", warehouse=f"file://{tmp_path}")
+    memory_catalog.create_namespace("default")
+    return memory_catalog.create_table(f"default.{name}", schema, properties={"format-version": "3"})
+
+
+def _wkb_storage(column: pa.ChunkedArray) -> list[Any]:
+    storage = column.cast(column.type.storage_type) if isinstance(column.type, pa.ExtensionType) else column
+    return storage.to_pylist()
+
+
+WKB_POINT_NEG = struct.pack("<BIdd", 1, 1, -3.0, 5.0)
+GEO_WRITE_SCHEMA = Schema(
+    NestedField(1, "id", IntegerType(), required=False),
+    NestedField(2, "geom", GeometryType("srid:3857"), required=False),
+    NestedField(3, "geom_default", GeometryType(), required=False),
+    NestedField(4, "geog", GeographyType("srid:4326"), required=False),
+)
+
+
+@pytest.mark.parametrize("binary_type", [pa.binary(), pa.large_binary()])
+def test_write_geo_from_plain_binary(tmp_path: Path, binary_type: pa.DataType) -> None:
+    pytest.importorskip("geoarrow.pyarrow")
+    tbl = _v3_table(tmp_path, GEO_WRITE_SCHEMA)
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_NEG], binary_type)
+    tbl.append(pa.table({"id": pa.array([1, 2, 3], pa.int32()), "geom": values, "geom_default": values, "geog": values}))
+
+    result = tbl.scan().to_arrow()
+    for name in ("geom", "geom_default", "geog"):
+        assert _wkb_storage(result.column(name)) == [WKB_POINT_1_2, None, WKB_POINT_NEG]
+
+    (data_file,) = [task.file for task in tbl.scan().plan_files()]
+    parquet_schema = str(pq.ParquetFile(data_file.file_path.removeprefix("file://")).schema)
+    assert "field_id=2 geom (Geometry(crs=srid:3857))" in parquet_schema
+    # The default CRS OGC:CRS84 is written as an empty CRS
+    assert "field_id=3 geom_default (Geometry(crs=))" in parquet_schema
+    assert "field_id=4 geog (Geography(crs=srid:4326, algorithm=spherical))" in parquet_schema
+
+    # Geometry bounds are the corners of the bounding box
+    for field_id in (2, 3):
+        assert GeospatialBound.from_bytes(data_file.lower_bounds[field_id]) == GeospatialBound(-3.0, 2.0)
+        assert GeospatialBound.from_bytes(data_file.upper_bounds[field_id]) == GeospatialBound(1.0, 5.0)
+    assert data_file.value_counts[2] == 3
+
+    readable_metrics = tbl.inspect.files().to_pylist()[0]["readable_metrics"]
+    assert GeospatialBound.from_bytes(readable_metrics["geom"]["lower_bound"]) == GeospatialBound(-3.0, 2.0)
+    assert readable_metrics["geom"]["value_count"] == 3
+
+
+def test_write_geo_from_geoarrow(tmp_path: Path) -> None:
+    ga = pytest.importorskip("geoarrow.pyarrow")
+    tbl = _v3_table(tmp_path, GEO_WRITE_SCHEMA)
+    wkb = pa.array([WKB_POINT_1_2, WKB_POINT_NEG], pa.binary())
+    geom = pa.ExtensionArray.from_storage(ga.wkb().with_crs("srid:3857"), wkb)
+    geom_default = pa.ExtensionArray.from_storage(ga.wkb(), wkb)
+    geog = pa.ExtensionArray.from_storage(ga.wkb().with_crs("srid:4326").with_edge_type(ga.EdgeType.SPHERICAL), wkb)
+    ids = pa.array([1, 2], pa.int32())
+
+    # A GeoArrow CRS that differs from the table CRS is a type mismatch
+    with pytest.raises(ValueError, match="Mismatch in fields"):
+        tbl.append(pa.table({"id": ids, "geom": geom_default, "geom_default": geom_default, "geog": geog}))
+
+    tbl.append(pa.table({"id": ids, "geom": geom, "geom_default": geom_default, "geog": geog}))
+
+    result = tbl.scan().to_arrow()
+    assert result.schema.field("geom").type == schema_to_pyarrow(GeometryType("srid:3857"))
+    for name in ("geom", "geom_default", "geog"):
+        assert _wkb_storage(result.column(name)) == [WKB_POINT_1_2, WKB_POINT_NEG]
+
+
+def test_write_geography_unsupported_edges_as_plain_binary(tmp_path: Path) -> None:
+    pytest.importorskip("geoarrow.pyarrow")
+    schema = Schema(NestedField(1, "geog", GeographyType("srid:4326", "vincenty"), required=False))
+    tbl = _v3_table(tmp_path, schema)
+    with pytest.warns(UserWarning, match="vincenty edge algorithm as plain WKB binary"):
+        tbl.append(pa.table({"geog": pa.array([WKB_POINT_1_2], pa.binary())}))
+
+    assert _wkb_storage(tbl.scan().to_arrow().column("geog")) == [WKB_POINT_1_2]
+    (data_file,) = [task.file for task in tbl.scan().plan_files()]
+    parquet_schema = str(pq.ParquetFile(data_file.file_path.removeprefix("file://")).schema)
+    assert "field_id=1 geog;" in parquet_schema
+    assert not data_file.lower_bounds
+
+
+def test_write_geo_without_geoarrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tbl = _v3_table(tmp_path, GEO_WRITE_SCHEMA)
+    # Importing a module set to None raises ImportError, as if geoarrow-pyarrow was not installed
+    monkeypatch.setitem(sys.modules, "geoarrow.pyarrow", None)
+    values = pa.array([WKB_POINT_1_2, None], pa.binary())
+    with pytest.warns(UserWarning, match="install pyiceberg\\[geoarrow\\]"):
+        tbl.append(pa.table({"id": pa.array([1, 2], pa.int32()), "geom": values, "geom_default": values, "geog": values}))
+
+    result = tbl.scan().to_arrow()
+    assert result.schema.field("geom").type == pa.large_binary()
+    assert result.column("geom").to_pylist() == [WKB_POINT_1_2, None]
+    (data_file,) = [task.file for task in tbl.scan().plan_files()]
+    # Lexicographic min/max of WKB are not geo bounds, so they are not recorded
+    assert 2 not in data_file.lower_bounds and 2 not in data_file.upper_bounds
+    assert data_file.null_value_counts[2] == 1
+
+
+def test_add_files_geo_bounds_from_parquet_statistics(tmp_path: Path) -> None:
+    ga = pytest.importorskip("geoarrow.pyarrow")
+    tbl = _v3_table(tmp_path, Schema(NestedField(1, "geom", GeometryType(), required=False)))
+    points = [struct.pack("<BIddd", 1, 1001, 1.0, 2.0, 3.0), struct.pack("<BIddd", 1, 1001, -1.0, 4.0, 5.0)]
+    geom = pa.ExtensionArray.from_storage(ga.wkb(), pa.array(points, pa.binary()))
+    arrow_schema = pa.schema([pa.field("geom", geom.type, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"})])
+    file_path = str(tmp_path / "geo_xyz.parquet")
+    pq.write_table(pa.Table.from_arrays([geom], schema=arrow_schema), file_path)
+    if not pq.ParquetFile(file_path).metadata.row_group(0).column(0).is_geo_stats_set:
+        pytest.skip("PyArrow does not write Parquet geospatial statistics")
+
+    tbl.add_files([file_path])
+
+    (data_file,) = [task.file for task in tbl.scan().plan_files()]
+    assert GeospatialBound.from_bytes(data_file.lower_bounds[1]) == GeospatialBound(-1.0, 2.0, 3.0)
+    assert GeospatialBound.from_bytes(data_file.upper_bounds[1]) == GeospatialBound(1.0, 4.0, 5.0)
+
+
+def _geo_statistics(**box: float) -> SimpleNamespace:
+    """Stand-in for the pyarrow GeoStatistics of a row group."""
+    return SimpleNamespace(**{key: box.get(key) for key in ("xmin", "ymin", "zmin", "mmin", "xmax", "ymax", "zmax", "mmax")})
+
+
+def test_geography_bounds_wrapping_antimeridian_are_omitted() -> None:
+    aggregator = GeospatialStatsAggregator(GeographyType())
+    aggregator.update_box(_geo_statistics(xmin=170.0, ymin=-10.0, xmax=-170.0, ymax=10.0))
+    assert aggregator.min_as_bytes() is None and aggregator.max_as_bytes() is None
+
+    aggregator = GeospatialStatsAggregator(GeographyType())
+    aggregator.update_box(_geo_statistics(xmin=-170.0, ymin=-10.0, xmax=170.0, ymax=10.0))
+    assert aggregator.min_as_bytes() == GeospatialBound(-170.0, -10.0).to_bytes()
+
+
+def test_geo_bounds_merge_row_groups() -> None:
+    aggregator = GeospatialStatsAggregator(GeometryType())
+    aggregator.update_box(_geo_statistics(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0, zmin=5.0, zmax=6.0))
+    aggregator.update_box(_geo_statistics(xmin=-1.0, ymin=0.5, xmax=0.5, ymax=2.0))
+    # Z is only kept when every row group has it
+    assert aggregator.min_as_bytes() == GeospatialBound(-1.0, 0.0).to_bytes()
+    assert aggregator.max_as_bytes() == GeospatialBound(1.0, 2.0).to_bytes()
+
+    # A row group without a bounding box (e.g. only nulls) invalidates the bounds
+    aggregator.update_box(None)
+    assert aggregator.min_as_bytes() is None
+
+
+def test_write_default_fills_missing_column(tmp_path: Path) -> None:
+    tbl = _v3_table(tmp_path, Schema(NestedField(1, "id", IntegerType(), required=False)))
+    tbl.append(pa.table({"id": pa.array([1], pa.int32())}))
+    with tbl.update_schema() as update:
+        update.add_column("color", StringType(), required=True, default_value="blue")
+    with tbl.update_schema() as update:
+        update.set_default_value("color", "green")
+
+    # The required column is missing from the dataframe, which is allowed because it has a write-default
+    tbl.append(pa.table({"id": pa.array([2], pa.int32())}))
+
+    result = tbl.scan().to_arrow().sort_by("id")
+    # Rows written before the column existed read the initial-default, new rows were written with the write-default
+    assert result.column("color").to_pylist() == ["blue", "green"]
+
+
+@pytest.mark.parametrize("read_type, unit", [(TimestampType(), "us"), (TimestampNanoType(), "ns")])
+def test_projection_date_promoted_to_timestamp(tmp_path: Path, read_type: PrimitiveType, unit: str) -> None:
+    arrow_schema = pa.schema([pa.field("d", pa.date32(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"})])
+    file = _write_table_to_file(
+        str(tmp_path / "date.parquet"), arrow_schema, pa.table({"d": [date(2024, 1, 2), None]}, schema=arrow_schema)
+    )
+    result = project(Schema(NestedField(1, "d", read_type, required=False)), [file])
+    assert result.schema.field("d").type == pa.timestamp(unit)
+    assert result.column("d").to_pylist() == [datetime(2024, 1, 2), None]
+
+
+def test_unknown_columns_are_not_written(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=False), NestedField(2, "u", UnknownType(), required=False))
+    tbl = _v3_table(tmp_path, schema)
+    tbl.append(pa.table({"id": pa.array([1], pa.int32())}))
+    tbl.append(pa.table({"id": pa.array([2], pa.int32()), "u": pa.nulls(1)}))
+
+    result = tbl.scan().to_arrow().sort_by("id")
+    assert result.column("u").to_pylist() == [None, None]
+    for task in tbl.scan().plan_files():
+        assert pq.ParquetFile(task.file.file_path.removeprefix("file://")).schema_arrow.names == ["id"]
 
 
 def test_projection_add_column(file_int: str) -> None:

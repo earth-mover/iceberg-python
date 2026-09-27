@@ -46,6 +46,7 @@ from pyiceberg.types import (
     TimestampType,
     TimestamptzType,
     TimeType,
+    UnknownType,
     UUIDType,
     _parse_geography_type,
     _parse_geometry_type,
@@ -248,6 +249,28 @@ def test_nested_field() -> None:
 
     with pytest.raises(pydantic_core.ValidationError, match=".*validation errors for NestedField.*"):
         _ = (NestedField(1, "field", StringType(), required=True, write_default=(1, "a", True)),)  # type: ignore
+
+
+def test_nested_field_pickle_keeps_defaults() -> None:
+    field_var = NestedField(1, "color", StringType(), required=True, initial_default="blue", write_default="green")
+    unpickled = pickle.loads(pickle.dumps(field_var))
+    assert unpickled == field_var
+    assert (unpickled.initial_default, unpickled.write_default) == ("blue", "green")
+    assert field_var.__getnewargs__() == (1, "color", StringType(), True, None, "blue", "green")
+
+
+def test_nested_field_unknown_must_be_optional() -> None:
+    assert NestedField(1, "u", UnknownType(), required=False).optional
+    with pytest.raises(ValueError, match="Columns of type unknown must be optional"):
+        NestedField(1, "u", UnknownType(), required=True)
+
+
+@pytest.mark.parametrize("field_type", [UnknownType(), GeometryType(), GeographyType()])
+def test_nested_field_null_only_types_reject_defaults(field_type: PrimitiveType) -> None:
+    with pytest.raises(ValueError, match="must default to null"):
+        NestedField(1, "f", field_type, required=False, initial_default=b"\x01")
+    with pytest.raises(ValueError, match="must default to null"):
+        NestedField(1, "f", field_type, required=False, write_default=b"\x01")
 
 
 def test_nested_field_complex_type_as_str_unsupported() -> None:

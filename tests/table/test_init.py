@@ -27,6 +27,7 @@ from pytest_lazy_fixtures import lf
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.noop import NoopCatalog
 from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import ValidationError as IcebergValidationError
 from pyiceberg.expressions import (
     AlwaysTrue,
     And,
@@ -105,6 +106,8 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IntegerType,
     ListType,
     LongType,
@@ -117,6 +120,7 @@ from pyiceberg.types import (
     TimestampType,
     TimestamptzType,
     TimeType,
+    UnknownType,
     UUIDType,
 )
 
@@ -2109,6 +2113,43 @@ def test_add_column_with_default_requires_v3(table_v2: Table, table_v3: Table) -
     )
     field = v3_schema._apply().find_field("added")
     assert (field.required, field.initial_default, field.write_default) == (True, 22, 22)
+
+
+@pytest.mark.parametrize("field_type", [GeometryType(), GeographyType(), UnknownType()])
+def test_add_column_null_only_types_reject_defaults(table_v3: Table, field_type: PrimitiveType) -> None:
+    with pytest.raises(ValueError, match="must default to null"):
+        UpdateSchema(transaction=table_v3.transaction()).add_column("added", field_type, default_value=b"\x01")
+
+    field = UpdateSchema(transaction=table_v3.transaction()).add_column("added", field_type)._apply().find_field("added")
+    assert (field.initial_default, field.write_default) == (None, None)
+
+
+def test_set_default_value_unknown_rejects_non_null(table_v3: Table) -> None:
+    with pytest.raises(ValueError, match="must default to null"):
+        UpdateSchema(transaction=table_v3.transaction()).set_default_value("u", "value")
+
+
+def test_update_column_unknown_promotion_on_v3(table_v3: Table) -> None:
+    applied = UpdateSchema(transaction=table_v3.transaction()).update_column("u", StringType())._apply()
+    assert applied.find_type("u") == StringType()
+
+
+@pytest.mark.parametrize("target", [TimestampType(), TimestampNanoType()])
+def test_update_column_date_to_timestamp_requires_v3(table_v2: Table, table_v3: Table, target: PrimitiveType) -> None:
+    date_schema = Schema(NestedField(10, "d", DateType(), required=False))
+
+    with pytest.raises(IcebergValidationError, match="requires format version 3 or higher, current format version is 2"):
+        UpdateSchema(transaction=table_v2.transaction(), schema=date_schema).update_column("d", target)
+
+    applied = UpdateSchema(transaction=table_v3.transaction(), schema=date_schema).update_column("d", target)._apply()
+    assert applied.find_type("d") == target
+
+
+def test_update_column_date_to_timestamp_rejects_identity_partition(table_v3: Table) -> None:
+    # The partition spec of table_v3 is identity(x) on field id 1, which would change value after promotion
+    date_schema = Schema(NestedField(1, "d", DateType(), required=False))
+    with pytest.raises(IcebergValidationError, match="the column is partitioned by identity"):
+        UpdateSchema(transaction=table_v3.transaction(), schema=date_schema).update_column("d", TimestampType())
 
 
 def test_union_by_name_uses_table_format_version(table_v3: Table) -> None:

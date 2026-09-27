@@ -100,6 +100,8 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IntegerType,
     LongType,
     PrimitiveType,
@@ -664,8 +666,16 @@ def test_unknown_type_conversions() -> None:
 
     # The spec defines no JSON single-value representation for unknown, since a
     # non-null initial-default or write-default is invalid for the type.
-    with pytest.raises(TypeError):
+    assert conversions.to_json(unknown, None) is None
+    assert conversions.from_json(unknown, None) is None
+    with pytest.raises(ValueError, match="must default to null"):
         conversions.to_json(unknown, "iceberg")
 
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="must default to null"):
         conversions.from_json(unknown, "iceberg")
+
+
+@pytest.mark.parametrize("geo_type", [GeometryType(), GeographyType()])
+def test_geo_json_null_default(geo_type: PrimitiveType) -> None:
+    """Geometry and geography columns must default to null, so null deserializes to None."""
+    assert conversions.from_json(geo_type, None) is None

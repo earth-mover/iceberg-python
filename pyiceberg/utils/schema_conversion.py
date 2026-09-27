@@ -17,6 +17,9 @@
 """Utility class for converting between Avro and Iceberg schemas."""
 
 import logging
+import uuid
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import (
     Any,
 )
@@ -56,7 +59,8 @@ from pyiceberg.types import (
     UnknownType,
     UUIDType,
 )
-from pyiceberg.utils.decimal import decimal_required_bytes
+from pyiceberg.utils.datetime import date_to_days, datetime_to_micros, datetime_to_nanos, time_to_micros
+from pyiceberg.utils.decimal import decimal_required_bytes, decimal_to_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +86,34 @@ LOGICAL_FIELD_TYPE_MAPPING: dict[tuple[str, str], PrimitiveType] = {
 }
 
 AvroType = str | Any
+
+
+def _to_avro_default(field_type: IcebergType, value: Any) -> Any:
+    """Encode a default value as the JSON default of the Avro type that the field is written as.
+
+    Avro encodes the default of a logical type as its underlying type: dates as int days, times and timestamps as
+    long micros (or nanos), and bytes, fixed, decimal and uuid values as strings of the code points 0-255.
+    """
+    if isinstance(field_type, DateType):
+        return date_to_days(value) if isinstance(value, date) else value
+    if isinstance(field_type, TimeType):
+        return time_to_micros(value) if isinstance(value, time) else value
+    if isinstance(field_type, (TimestampType, TimestamptzType)):
+        return datetime_to_micros(value) if isinstance(value, datetime) else value
+    if isinstance(field_type, (TimestampNanoType, TimestamptzNanoType)):
+        return datetime_to_nanos(value) if isinstance(value, datetime) else value
+    if isinstance(field_type, UUIDType):
+        uuid_bytes = value.bytes if isinstance(value, uuid.UUID) else value
+        return uuid_bytes.decode("latin-1")
+    if isinstance(field_type, DecimalType):
+        scaled = Decimal(value).quantize(Decimal(1).scaleb(-field_type.scale))
+        unscaled = decimal_to_bytes(scaled, byte_length=decimal_required_bytes(field_type.precision))
+        return unscaled.decode("latin-1")
+    if isinstance(field_type, (BinaryType, FixedType)):
+        return bytes(value).decode("latin-1")
+    if isinstance(field_type, PrimitiveType):
+        return value
+    raise ValueError(f"Cannot encode an Avro default for {field_type}: {value}")
 
 
 class AvroSchemaConversion:
@@ -236,12 +268,14 @@ class AvroSchemaConversion:
             raise ValueError(f"Cannot convert field, missing {FIELD_ID_PROP}: {field}")
 
         plain_type, required = self._resolve_union(field["type"])
+        field_type = self._convert_schema(plain_type)
 
         return NestedField(
             field_id=field[FIELD_ID_PROP],
             name=field["name"],
-            field_type=self._convert_schema(plain_type),
-            required=required,
+            field_type=field_type,
+            # A column of type unknown is always optional, even though Avro encodes it as a plain null
+            required=required and not isinstance(field_type, UnknownType),
             doc=field.get("doc"),
         )
 
@@ -539,19 +573,22 @@ class ConvertSchemaToAvro(SchemaVisitorPerPrimitiveType[AvroType]):
         original_name = field.name
         sanitized_name = make_compatible_name(original_name)
 
+        is_null = isinstance(field.field_type, UnknownType)
         result = {
             "name": sanitized_name,
             FIELD_ID_PROP: field.field_id,
-            "type": field_result if field.required else ["null", field_result],
+            # A union of null with null is not valid Avro
+            "type": field_result if field.required or is_null else ["null", field_result],
         }
 
         if original_name != sanitized_name:
             result[ICEBERG_FIELD_NAME_PROP] = original_name
 
-        if field.write_default is not None:
-            result["default"] = field.write_default
-        elif field.optional:
+        if field.optional or is_null:
+            # The Avro default of a union must match its first branch, which is null
             result["default"] = None
+        elif field.write_default is not None:
+            result["default"] = _to_avro_default(field.field_type, field.write_default)
 
         if field.doc is not None:
             result["doc"] = field.doc

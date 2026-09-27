@@ -40,10 +40,11 @@ The `files`, `data_files`, `delete_files`, `entries` and `all_*` inspect tables 
 | Position delete files (v2 style) | Yes | No | |
 | Equality deletes | No | No | |
 | `timestamp_ns` / `timestamptz_ns` | Yes | No | Values are read with nanosecond precision. Row filters and partition pruning work on nanosecond columns. |
-| `unknown` | Yes | No | Reads as null. |
+| `unknown` | Yes | Yes | Reads as null. Unknown columns must be optional with a null default and are not stored in data files. |
 | `variant` | No | No | Tables with a variant column cannot be loaded yet. |
-| `geometry` / `geography` | Yes | No | Type strings are parsed and serialized in the Java/spec form, e.g. `geometry(srid:3857)`. Only equality and null predicates are supported, and bounds are not used to skip files. See [Geospatial types](geospatial.md). |
-| Default values (`initial-default`, `write-default`) | Yes | Partial | `initial-default` is applied on read. Adding a column with a default value requires a v3 table. |
+| `geometry` / `geography` | Yes | Yes | Type strings are parsed and serialized in the Java/spec form, e.g. `geometry(srid:3857)`. WKB can be appended as binary or GeoArrow columns; with `geoarrow-pyarrow` installed the Parquet `GEOMETRY`/`GEOGRAPHY` logical types are written. Geometry bounds are written as bounding-box points. Only equality and null predicates are supported, and bounds are not used to skip files. See [Geospatial types](geospatial.md). |
+| Default values (`initial-default`, `write-default`) | Yes | Yes | `initial-default` is applied on read and `write-default` fills columns missing from appended data, so a required column with a `write-default` may be left out. Adding a column with a default value requires a v3 table. `unknown`, `geometry` and `geography` columns must default to null. |
+| Type promotions | Yes | Yes | `unknown` to any primitive type and `date` to `timestamp` / `timestamp_ns` are only allowed on v3 tables; `date` promotion is rejected when the column is partitioned by a transform other than `year`, `month` or `day`. |
 | Multi-argument transforms | No | No | Loading a table whose spec uses `source-ids` with more than one id raises. |
 | Table encryption | Metadata only | No | `encryption-keys` and `key-id` round-trip through metadata. |
 

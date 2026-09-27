@@ -972,7 +972,7 @@ EXAMPLE_TABLE_METADATA_V3: dict[str, Any] = {
                 {"id": 1, "name": "x", "required": True, "type": "long"},
                 {"id": 2, "name": "y", "required": True, "type": "long", "doc": "comment"},
                 {"id": 3, "name": "z", "required": True, "type": "long"},
-                {"id": 4, "name": "u", "required": True, "type": "unknown"},
+                {"id": 4, "name": "u", "required": False, "type": "unknown"},
                 {"id": 5, "name": "ns", "required": True, "type": "timestamp_ns"},
                 {"id": 6, "name": "nstz", "required": True, "type": "timestamptz_ns"},
             ],

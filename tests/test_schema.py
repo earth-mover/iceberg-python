@@ -55,6 +55,7 @@ from pyiceberg.types import (
     PrimitiveType,
     StringType,
     StructType,
+    TimestampNanoType,
     TimestampType,
     TimestamptzType,
     TimeType,
@@ -898,6 +899,8 @@ def should_promote(file_type: IcebergType, read_type: IcebergType) -> bool:
     if isinstance(file_type, DecimalType) and isinstance(read_type, DecimalType):
         return can_promote_decimal(file_type, read_type)
     if isinstance(file_type, FixedType) and isinstance(read_type, UUIDType) and len(file_type) == 16:
+        return True
+    if isinstance(file_type, DateType) and isinstance(read_type, (TimestampType, TimestampNanoType)):
         return True
     return False
 

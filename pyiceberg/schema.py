@@ -1465,6 +1465,8 @@ class _SanitizeColumnsVisitor(SchemaVisitor[IcebergType | None]):
             field_type=field_result,
             doc=field.doc,
             required=field.required,
+            initial_default=field.initial_default,
+            write_default=field.write_default,
         )
 
     def struct(self, struct: StructType, field_results: builtins.list[IcebergType | None]) -> IcebergType | None:
@@ -1695,6 +1697,15 @@ def _(file_type: BinaryType, read_type: IcebergType) -> IcebergType:
         raise ResolveError(f"Cannot promote an binary to {read_type}")
 
 
+@promote.register(DateType)
+def _(file_type: DateType, read_type: IcebergType) -> IcebergType:
+    if isinstance(read_type, (TimestampType, TimestampNanoType)):
+        # Format version 3 allows date -> timestamp and date -> timestamp_ns, reading a date as midnight
+        return read_type
+    else:
+        raise ResolveError(f"Cannot promote a date to {read_type}")
+
+
 @promote.register(DecimalType)
 def _(file_type: DecimalType, read_type: IcebergType) -> IcebergType:
     if isinstance(read_type, DecimalType):
@@ -1762,7 +1773,7 @@ class _SchemaCompatibilityVisitor(PreOrderSchemaVisitor[bool]):
         try:
             rhs = self.provided_schema.find_field(lhs.field_id)
         except ValueError:
-            if lhs.required:
+            if lhs.required and lhs.write_default is None:
                 self.rich_table.add_row("❌", str(lhs), "Missing")
                 return False
             else:

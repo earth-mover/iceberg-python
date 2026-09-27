@@ -32,6 +32,7 @@ import importlib
 import itertools
 import json
 import logging
+import math
 import operator
 import os
 import re
@@ -190,6 +191,7 @@ from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.config import Config
 from pyiceberg.utils.datetime import millis_to_datetime
 from pyiceberg.utils.decimal import unscaled_to_decimal
+from pyiceberg.utils.geo import geo_bounds_from_bbox
 from pyiceberg.utils.properties import get_first_property_value, property_as_bool, property_as_int
 from pyiceberg.utils.singleton import Singleton
 from pyiceberg.utils.truncate import truncate_upper_bound_binary_string, truncate_upper_bound_text_string
@@ -867,6 +869,16 @@ class _ConvertToArrowSchema(SchemaVisitorPerPrimitiveType[pa.DataType]):
 GEOARROW_WKB_EXTENSION_NAME = "geoarrow.wkb"
 
 
+def _geoarrow_available() -> bool:
+    """Return whether geoarrow-pyarrow is installed."""
+    try:
+        import geoarrow.pyarrow  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def _geoarrow_crs_to_iceberg(crs: Any) -> str:
     """Convert the CRS of a GeoArrow extension type to an Iceberg CRS string."""
     if crs is None:
@@ -1464,7 +1476,9 @@ class _ConvertToIceberg(PyArrowSchemaVisitor[IcebergType | Schema]):
         field_id = self._field_id(field)
         field_doc = doc_str.decode() if (field.metadata and (doc_str := field.metadata.get(PYARROW_FIELD_DOC_KEY))) else None
         field_type = field_result
-        return NestedField(field_id, field.name, field_type, required=not field.nullable, doc=field_doc)
+        # A column of type unknown is always optional
+        required = not field.nullable and not isinstance(field_type, UnknownType)
+        return NestedField(field_id, field.name, field_type, required=required, doc=field_doc)
 
     def list(self, list_type: pa.ListType, element_result: IcebergType) -> ListType:
         element_field = list_type.value_field
@@ -2023,6 +2037,7 @@ def _to_requested_schema(
     projected_missing_fields: dict[int, Any] = EMPTY_DICT,
     allow_timestamp_tz_mismatch: bool = False,
     format_model: FileFormatModel | None = None,
+    for_write: bool = False,
 ) -> pa.RecordBatch:
     # We could reuse some of these visitors
     struct_array = visit_with_partner(
@@ -2035,6 +2050,7 @@ def _to_requested_schema(
             projected_missing_fields=projected_missing_fields,
             allow_timestamp_tz_mismatch=allow_timestamp_tz_mismatch,
             format_model=format_model,
+            for_write=for_write,
         ),
         ArrowAccessor(file_schema),
     )
@@ -2048,6 +2064,7 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
     _projected_missing_fields: dict[int, Any]
     _allow_timestamp_tz_mismatch: bool
     _format_model: FileFormatModel | None
+    _for_write: bool
 
     def __init__(
         self,
@@ -2057,6 +2074,7 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
         projected_missing_fields: dict[int, Any] = EMPTY_DICT,
         allow_timestamp_tz_mismatch: bool = False,
         format_model: FileFormatModel | None = None,
+        for_write: bool = False,
     ) -> None:
         if include_field_ids and format_model is None:
             raise ValueError("format_model is required when include_field_ids=True")
@@ -2068,12 +2086,38 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
         # Allowed for reading (aligns with Spark); disallowed for writing to enforce Iceberg spec's strict typing.
         self._allow_timestamp_tz_mismatch = allow_timestamp_tz_mismatch
         self._format_model = format_model
+        # When True, the projection produces a batch for a data file: missing columns are filled from the
+        # write-default, unknown columns are dropped, and geo columns use a type the Parquet writer supports
+        self._for_write = for_write
+
+    def _arrow_type(self, field_type: IcebergType) -> pa.DataType:
+        """Return the Arrow type of a projected column."""
+        if self._for_write and isinstance(field_type, GeographyType) and field_type.algorithm != "spherical":
+            # The Parquet writer only supports spherical edges for the GEOGRAPHY logical type
+            warnings.warn(
+                f"Writing geography with the {field_type.algorithm} edge algorithm as plain WKB binary: "
+                "the Parquet GEOGRAPHY logical type is only written for spherical edges",
+                stacklevel=2,
+            )
+            return pa.large_binary()
+        if self._for_write and isinstance(field_type, (GeometryType, GeographyType)) and not _geoarrow_available():
+            warnings.warn(
+                "Writing geometry/geography as plain WKB binary; install pyiceberg[geoarrow] to write the Parquet "
+                "GEOMETRY/GEOGRAPHY logical types",
+                stacklevel=2,
+            )
+        return schema_to_pyarrow(field_type, include_field_ids=self._include_field_ids)
 
     def _cast_if_needed(self, field: NestedField, values: pa.Array) -> pa.Array:
         file_field = self._file_schema.find_field(field.field_id)
 
         if field.field_type.is_primitive:
-            if (target_type := schema_to_pyarrow(field.field_type, include_field_ids=self._include_field_ids)) != values.type:
+            if (target_type := self._arrow_type(field.field_type)) != values.type:
+                if isinstance(file_field.field_type, DateType) and isinstance(
+                    field.field_type, (TimestampType, TimestampNanoType)
+                ):
+                    # Format version 3 date -> timestamp promotion reads a date as midnight
+                    return values.cast(target_type)
                 if field.field_type == TimestampType():
                     source_tz_compatible = values.type.tz is None or (
                         self._allow_timestamp_tz_mismatch and values.type.tz in UTC_ALIASES
@@ -2171,20 +2215,27 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
         field_arrays: list[pa.Array] = []
         fields: list[pa.Field] = []
         for field, field_array in zip(struct.fields, field_results, strict=True):
+            if self._for_write and isinstance(field.field_type, UnknownType):
+                # Columns of type unknown are always null and are not stored in data files
+                continue
+            # Writes fill missing columns from the write-default, reads from the initial-default
+            default = field.initial_default
+            if self._for_write and field.write_default is not None:
+                default = field.write_default
             if field_array is not None:
                 array = self._cast_if_needed(field, field_array)
                 field_arrays.append(array)
                 fields.append(self._construct_field(field, array.type))
-            elif field.optional or field.initial_default is not None:
-                # When an optional field is added, or when a required field with a non-null initial default is added
-                arrow_type = schema_to_pyarrow(field.field_type, include_field_ids=self._include_field_ids)
+            elif field.optional or default is not None:
+                # When an optional field is added, or when a required field with a non-null default is added
+                arrow_type = self._arrow_type(field.field_type)
                 projected_value = self._projected_missing_fields.get(field.field_id)
                 if projected_value is not None:
                     field_arrays.append(pa.repeat(pa.scalar(projected_value, type=arrow_type), len(struct_array)))
-                elif field.initial_default is None:
+                elif default is None:
                     field_arrays.append(pa.nulls(len(struct_array), type=arrow_type))
                 else:
-                    field_arrays.append(pa.repeat(pa.scalar(field.initial_default, type=arrow_type), len(struct_array)))
+                    field_arrays.append(pa.repeat(pa.scalar(default, type=arrow_type), len(struct_array)))
                 fields.append(self._construct_field(field, arrow_type))
             else:
                 raise ResolveError(f"Field is required, and could not be found in the file: {field}")
@@ -2425,6 +2476,70 @@ class StatsAggregator:
             if self.trunc_length is not None:
                 raise ValueError(f"{self.primitive_type} cannot be truncated")
             return self.serialize(self.current_max)
+
+
+class GeospatialStatsAggregator(StatsAggregator):
+    """Aggregates the Parquet geospatial statistics of a geometry or geography column into bounding-box bounds.
+
+    Parquet min/max statistics on WKB values are lexicographic and meaningless as geo bounds, so the bounds are
+    built from the bounding box in `ColumnChunkMetaData.geo_statistics` instead. Any row group without a bounding
+    box invalidates the bounds of the whole file.
+    """
+
+    _BOX_KEYS = ("xmin", "ymin", "zmin", "mmin", "xmax", "ymax", "zmax", "mmax")
+
+    def __init__(self, iceberg_type: PrimitiveType) -> None:
+        self.current_min = None
+        self.current_max = None
+        self.trunc_length = None
+        self.primitive_type = iceberg_type
+        self._box: dict[str, float | None] | None = None
+        self._valid = True
+
+    def update_box(self, geo_statistics: Any | None) -> None:
+        """Merge the bounding box of a row group; a missing X/Y range invalidates the bounds."""
+        box: dict[str, float | None] = {key: getattr(geo_statistics, key, None) for key in self._BOX_KEYS}
+        if any((value := box[key]) is None or not math.isfinite(value) for key in ("xmin", "ymin", "xmax", "ymax")):
+            self._valid = False
+            return
+        if self._box is None:
+            self._box = box
+            return
+        for key in self._BOX_KEYS:
+            current, new = self._box[key], box[key]
+            if current is None or new is None:
+                # Z and M are only kept when every row group has them
+                self._box[key] = None
+            else:
+                self._box[key] = min(current, new) if key.endswith("min") else max(current, new)
+
+    def _bounds(self) -> tuple[bytes, bytes] | None:
+        if not self._valid or self._box is None:
+            return None
+        xmin, ymin, xmax, ymax = (self._box[key] for key in ("xmin", "ymin", "xmax", "ymax"))
+        if xmin is None or ymin is None or xmax is None or ymax is None:
+            return None
+        if isinstance(self.primitive_type, GeographyType) and xmin > xmax:
+            # The bounding box wraps the antimeridian; omitting the bounds is always spec-compliant
+            return None
+        return geo_bounds_from_bbox(
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            zmin=self._box["zmin"],
+            zmax=self._box["zmax"],
+            mmin=self._box["mmin"],
+            mmax=self._box["mmax"],
+        )
+
+    def min_as_bytes(self) -> bytes | None:
+        bounds = self._bounds()
+        return bounds[0] if bounds is not None else None
+
+    def max_as_bytes(self) -> bytes | None:
+        bounds = self._bounds()
+        return bounds[1] if bounds is not None else None
 
 
 _PARQUET_TIME_UNIT_TO_NANOS = {"milliseconds": 1_000_000, "microseconds": 1_000, "nanoseconds": 1}
@@ -2692,9 +2807,10 @@ def data_file_statistics_from_parquet_metadata(
     null_value_counts: dict[int, int] = {}
     nan_value_counts: dict[int, int] = {}
 
-    col_aggs = {}
+    col_aggs: dict[int, StatsAggregator] = {}
 
     invalidate_col: set[int] = set()
+    invalidate_null_count: set[int] = set()
     for r in range(parquet_metadata.num_row_groups):
         # References:
         # https://github.com/apache/iceberg/blob/fc381a81a1fdb8f51a0637ca27cd30673bd7aad3/parquet/src/main/java/org/apache/iceberg/parquet/ParquetUtil.java#L232
@@ -2723,6 +2839,19 @@ def data_file_statistics_from_parquet_metadata(
                 continue
 
             value_counts[field_id] = value_counts.get(field_id, 0) + column.num_values
+
+            if isinstance(stats_col.iceberg_type, (GeometryType, GeographyType)):
+                if column.is_stats_set and column.statistics.has_null_count:
+                    null_value_counts[field_id] = null_value_counts.get(field_id, 0) + column.statistics.null_count
+                else:
+                    invalidate_null_count.add(field_id)
+                if stats_col.mode != MetricsMode(MetricModeTypes.COUNTS):
+                    geo_agg = col_aggs.setdefault(field_id, GeospatialStatsAggregator(stats_col.iceberg_type))
+                    if isinstance(geo_agg, GeospatialStatsAggregator):
+                        # Parquet GEOMETRY/GEOGRAPHY logical types carry a bounding box (pyarrow >= 21)
+                        is_geo_stats_set = getattr(column, "is_geo_stats_set", False)
+                        geo_agg.update_box(column.geo_statistics if is_geo_stats_set else None)
+                continue
 
             if column.is_stats_set:
                 try:
@@ -2776,6 +2905,9 @@ def data_file_statistics_from_parquet_metadata(
 
     for field_id in invalidate_col:
         col_aggs.pop(field_id, None)
+        null_value_counts.pop(field_id, None)
+
+    for field_id in invalidate_null_count:
         null_value_counts.pop(field_id, None)
 
     return DataFileStatistics(
@@ -2890,6 +3022,7 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
                 downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
                 include_field_ids=True,
                 format_model=format_model,
+                for_write=True,
             )
             for batch in task.record_batches
         ]
