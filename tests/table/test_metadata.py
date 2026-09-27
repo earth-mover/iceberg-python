@@ -206,11 +206,10 @@ def test_serialize_v3_with_encryption_keys(example_table_metadata_v3: dict[str, 
 
 
 def test_parse_v3_without_next_row_id(example_table_metadata_v3: dict[str, Any]) -> None:
+    # Defaulting to 0 could hand out row IDs that are already assigned, so the spec-required key must be present
     metadata = {key: value for key, value in example_table_metadata_v3.items() if key != "next-row-id"}
-    table_metadata = TableMetadataV3(**metadata)
-
-    assert table_metadata.next_row_id == 0
-    assert json.loads(table_metadata.model_dump_json())["next-row-id"] == 0
+    with pytest.raises((ValidationError, PydanticValidationError), match="next-row-id"):
+        TableMetadataV3(**metadata)
 
 
 def test_migrate_v1_schemas(example_table_metadata_v1: dict[str, Any]) -> None:

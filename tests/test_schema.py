@@ -26,6 +26,7 @@ from pyiceberg.schema import (
     Accessor,
     Schema,
     _check_schema_compatible,
+    assign_fresh_schema_ids,
     build_position_accessors,
     index_by_id,
     index_by_name,
@@ -1882,3 +1883,14 @@ def test_check_schema_compatible_optional_map_field_present() -> None:
     )
     # Should not raise - schemas match
     _check_schema_compatible(requested_schema, provided_schema)
+
+
+def test_assign_fresh_schema_ids_keeps_defaults() -> None:
+    schema = Schema(
+        NestedField(10, "c", StringType(), required=True, initial_default="init", write_default="wd"),
+        NestedField(11, "s", StructType(NestedField(12, "n", IntegerType(), required=False, initial_default=1, write_default=2))),
+    )
+    fresh = assign_fresh_schema_ids(schema)
+    assert fresh.find_field("c").field_id == 1
+    assert (fresh.find_field("c").initial_default, fresh.find_field("c").write_default) == ("init", "wd")
+    assert (fresh.find_field("s.n").initial_default, fresh.find_field("s.n").write_default) == (1, 2)

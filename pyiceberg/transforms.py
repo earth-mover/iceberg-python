@@ -17,6 +17,7 @@
 
 import base64
 import datetime as py_datetime
+import re
 import struct
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -29,7 +30,6 @@ from uuid import UUID
 import mmh3
 from pydantic import Field, PositiveInt, PrivateAttr, model_serializer, model_validator
 
-from pyiceberg.exceptions import ValidationError
 from pyiceberg.expressions import (
     BoundEqualTo,
     BoundGreaterThan,
@@ -111,6 +111,8 @@ DAY = "day"
 HOUR = "hour"
 
 BUCKET_PARSER = ParseNumberFromBrackets(BUCKET)
+# name[argument] with nothing after the closing bracket
+_BRACKET_FORM = re.compile(r"^[a-z_]+\[[^\]]*\]$")
 TRUNCATE_PARSER = ParseNumberFromBrackets(TRUNCATE)
 
 
@@ -216,16 +218,12 @@ def parse_transform(v: Any) -> Transform[Any, Any]:
             return IdentityTransform()
         elif v == VOID:
             return VoidTransform()
-        elif v.startswith(BUCKET):
-            try:
-                return BucketTransform(num_buckets=BUCKET_PARSER.match(v))
-            except ValidationError:
-                return UnknownTransform(transform=v)
-        elif v.startswith(TRUNCATE):
-            try:
-                return TruncateTransform(width=TRUNCATE_PARSER.match(v))
-            except ValidationError:
-                return UnknownTransform(transform=v)
+        elif _BRACKET_FORM.match(v) and v.startswith(f"{BUCKET}["):
+            # A known transform with a malformed argument is an error; an unknown name that merely shares the
+            # prefix (bucketv2[4], bucket[4]v2) is a different transform and is preserved as-is below
+            return BucketTransform(num_buckets=BUCKET_PARSER.match(v))
+        elif _BRACKET_FORM.match(v) and v.startswith(f"{TRUNCATE}["):
+            return TruncateTransform(width=TRUNCATE_PARSER.match(v))
         elif v == YEAR:
             return YearTransform()
         elif v == MONTH:

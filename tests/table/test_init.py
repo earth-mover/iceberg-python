@@ -2124,6 +2124,14 @@ def test_add_column_null_only_types_reject_defaults(table_v3: Table, field_type:
     assert (field.initial_default, field.write_default) == (None, None)
 
 
+def test_set_default_value_requires_v3(table_v2: Table) -> None:
+    with pytest.raises(ValueError, match="default values require format version 3 or higher, current format version is 2"):
+        UpdateSchema(transaction=table_v2.transaction()).set_default_value("x", 22)
+
+    allowed = UpdateSchema(transaction=table_v2.transaction(), allow_incompatible_changes=True)
+    assert allowed.set_default_value("x", 22)._apply().find_field("x").write_default == 22
+
+
 def test_set_default_value_unknown_rejects_non_null(table_v3: Table) -> None:
     with pytest.raises(ValueError, match="must default to null"):
         UpdateSchema(transaction=table_v3.transaction()).set_default_value("u", "value")

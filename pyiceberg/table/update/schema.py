@@ -437,6 +437,13 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         if default_value is not None and isinstance(field.field_type, (GeometryType, GeographyType, UnknownType)):
             raise ValueError(f"Invalid default value: columns of type {field.field_type} must default to null: {name}")
 
+        format_version = self._transaction.table_metadata.format_version
+        if default_value is not None and format_version < 3 and not self._allow_incompatible_changes:
+            raise ValueError(
+                f"Incompatible change: default values require format version 3 or higher, "
+                f"current format version is {format_version}: {name}"
+            )
+
         if default_value is not None:
             try:
                 # To make sure that the value is valid for the type

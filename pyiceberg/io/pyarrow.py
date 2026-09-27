@@ -2523,10 +2523,8 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
             if self._for_write and isinstance(field.field_type, UnknownType):
                 # Columns of type unknown are always null and are not stored in data files
                 continue
-            # Writes fill missing columns from the write-default, reads from the initial-default
-            default = field.initial_default
-            if self._for_write and field.write_default is not None:
-                default = field.write_default
+            # Writes fill missing columns from the write-default only, reads from the initial-default
+            default = field.write_default if self._for_write else field.initial_default
             if field_array is not None:
                 array = self._cast_if_needed(field, field_array)
                 field_arrays.append(array)

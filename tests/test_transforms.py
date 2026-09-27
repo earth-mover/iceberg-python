@@ -588,10 +588,20 @@ def test_parse_transform_unknown_with_known_prefix() -> None:
     # unknown transforms that share a prefix with known ones must not fail parsing
     from pyiceberg.transforms import parse_transform
 
-    for name in ("bucketv2[4]", "truncatev2[8]", "bucket", "truncate[x]"):
+    for name in ("bucketv2[4]", "truncatev2[8]", "bucket", "truncate"):
         transform = parse_transform(name)
         assert isinstance(transform, UnknownTransform), name
         assert str(transform) == name
+
+
+def test_parse_transform_rejects_malformed_arguments() -> None:
+    # a known transform with an unparsable argument is an error, not an unknown transform
+    from pyiceberg.exceptions import ValidationError
+    from pyiceberg.transforms import parse_transform
+
+    for name in ("bucket[abc]", "truncate[]", "bucket[]"):
+        with pytest.raises(ValidationError):
+            parse_transform(name)
 
 
 def test_parse_transform_rejects_trailing_text_after_brackets() -> None:

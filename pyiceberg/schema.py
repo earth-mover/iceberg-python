@@ -1360,6 +1360,8 @@ class _SetFreshIDs(PreOrderSchemaVisitor[IcebergType]):
                     field_type=field_type(),
                     required=field.required,
                     doc=field.doc,
+                    initial_default=field.initial_default,
+                    write_default=field.write_default,
                 )
             )
         return StructType(*new_fields)

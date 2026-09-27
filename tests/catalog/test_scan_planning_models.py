@@ -819,3 +819,22 @@ def test_scan_load_table_override_survives_invalid_catalog_mode(
     assert scan._should_use_server_side_planning() is True
     assert [task.file.file_path for task in scan.plan_files()] == ["s3://bucket/tbl/data/file1.parquet"]
     assert plan_mock.call_count == 1
+
+
+def test_file_scan_task_from_rest_response_carries_v3_fields() -> None:
+    from pyiceberg.table import FileScanTask
+
+    data_file = {**_rest_data_file(), "first-row-id": 42}
+    delete_file = {
+        **_rest_position_delete_file(file_path="s3://bucket/table/deletes.puffin", file_format="puffin"),
+        "referenced-data-file": "s3://bucket/table/data/file.parquet",
+    }
+    scan_tasks = ScanTasks.model_validate(
+        {"delete-files": [delete_file], "file-scan-tasks": [{"data-file": data_file, "delete-file-references": [0]}]}
+    )
+    task = FileScanTask.from_rest_response(scan_tasks.file_scan_tasks[0], scan_tasks.delete_files)
+    assert task.file.first_row_id == 42
+    (dv,) = task.delete_files
+    assert dv.referenced_data_file == "s3://bucket/table/data/file.parquet"
+    assert dv.content_offset == 100
+    assert dv.content_size_in_bytes == 200

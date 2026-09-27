@@ -616,10 +616,11 @@ class TableMetadataV3(TableMetadataCommonFields, IcebergBaseModel):
     """The table’s highest assigned sequence number, a monotonically
     increasing long that tracks the order of snapshots in a table."""
 
-    next_row_id: int = Field(alias="next-row-id", default=INITIAL_ROW_ID)
+    next_row_id: int = Field(alias="next-row-id")
     """A long higher than all assigned row IDs; the next snapshot's `first-row-id`.
 
-    Starts at 0 when a table is created or upgraded to V3.
+    Required in V3: starting at 0 for a missing value could hand out row IDs that are already assigned.
+    Set to 0 when a table is created or upgraded to V3.
     """
 
     encryption_keys: list[EncryptedKey] = Field(alias="encryption-keys", default_factory=list)

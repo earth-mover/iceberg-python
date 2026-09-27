@@ -2432,7 +2432,7 @@ class FileScanTask(ScanTask):
 
 def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
     """Convert a REST content file to a manifest DataFile."""
-    from pyiceberg.catalog.rest.scan_planning import RESTDataFile, RESTEqualityDeleteFile
+    from pyiceberg.catalog.rest.scan_planning import RESTDataFile, RESTEqualityDeleteFile, RESTPositionDeleteFile
 
     if isinstance(rest_file, RESTDataFile):
         column_sizes = rest_file.column_sizes.to_dict() if rest_file.column_sizes else None
@@ -2459,6 +2459,10 @@ def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
         split_offsets=rest_file.split_offsets,
         sort_order_id=rest_file.sort_order_id,
         equality_ids=rest_file.equality_ids if isinstance(rest_file, RESTEqualityDeleteFile) else None,
+        first_row_id=rest_file.first_row_id if isinstance(rest_file, RESTDataFile) else None,
+        referenced_data_file=rest_file.referenced_data_file if isinstance(rest_file, RESTPositionDeleteFile) else None,
+        content_offset=rest_file.content_offset if isinstance(rest_file, RESTPositionDeleteFile) else None,
+        content_size_in_bytes=rest_file.content_size_in_bytes if isinstance(rest_file, RESTPositionDeleteFile) else None,
     )
     data_file.spec_id = rest_file.spec_id
     return data_file
