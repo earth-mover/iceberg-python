@@ -26,7 +26,7 @@ from pyiceberg.expressions import AlwaysTrue, BooleanExpression
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile, PartitionFieldSummary
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.table.snapshots import Snapshot, ancestors_of
-from pyiceberg.types import PrimitiveType
+from pyiceberg.types import GeographyType, GeometryType, IcebergType, PrimitiveType, UnknownType
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.singleton import _convert_to_hashable_type
 
@@ -39,7 +39,23 @@ ALWAYS_TRUE = AlwaysTrue()
 
 
 def _readable_bound(field_type: PrimitiveType, bound: bytes | None) -> Any | None:
-    return from_bytes(field_type, bound) if bound is not None else None
+    if bound is None or isinstance(field_type, UnknownType):
+        return None
+    return from_bytes(field_type, bound)
+
+
+def _readable_bound_arrow_type(field_type: IcebergType) -> pa.DataType:
+    """Return the Arrow type of a readable lower/upper bound for a column."""
+    import pyarrow as pa
+
+    from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+    if isinstance(field_type, (GeometryType, GeographyType)):
+        # Geo bounds are WKB bounding-box points, surfaced as raw bytes rather than as a GeoArrow extension type
+        return pa.binary()
+    if isinstance(field_type, UnknownType):
+        return pa.null()
+    return schema_to_pyarrow(field_type)
 
 
 class InspectTable:
@@ -176,7 +192,7 @@ class InspectTable:
         readable_metrics_struct = []
 
         def _readable_metrics_struct(bound_type: PrimitiveType) -> pa.StructType:
-            pa_bound_type = schema_to_pyarrow(bound_type)
+            pa_bound_type = _readable_bound_arrow_type(bound_type)
             return pa.struct(
                 [
                     pa.field("column_size", pa.int64(), nullable=True),
@@ -813,7 +829,7 @@ class InspectTable:
         readable_metrics_struct = []
 
         def _readable_metrics_struct(bound_type: PrimitiveType) -> pa.StructType:
-            pa_bound_type = schema_to_pyarrow(bound_type)
+            pa_bound_type = _readable_bound_arrow_type(bound_type)
             return pa.struct(
                 [
                     pa.field("column_size", pa.int64(), nullable=True),

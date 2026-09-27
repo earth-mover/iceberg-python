@@ -76,11 +76,15 @@ from pyiceberg.utils.datetime import (
     time_str_to_micros,
     time_to_micros,
     timestamp_to_micros,
+    timestamp_to_nanos,
     timestamptz_to_micros,
+    timestamptz_to_nanos,
     to_human_day,
     to_human_time,
     to_human_timestamp,
+    to_human_timestamp_ns,
     to_human_timestamptz,
+    to_human_timestamptz_ns,
 )
 from pyiceberg.utils.decimal import decimal_to_bytes, unscaled_to_decimal
 
@@ -463,6 +467,22 @@ def _(_: TimestamptzType, val: int | datetime) -> str:
     return to_human_timestamptz(val)
 
 
+@to_json.register(TimestampNanoType)
+def _(_: TimestampNanoType, val: int | datetime) -> str:
+    """Python datetime (without timezone) or nanoseconds since epoch serializes into an ISO8601 timestamp with nanoseconds."""
+    if isinstance(val, datetime):
+        val = datetime_to_nanos(val)
+    return to_human_timestamp_ns(val)
+
+
+@to_json.register(TimestamptzNanoType)
+def _(_: TimestamptzNanoType, val: int | datetime) -> str:
+    """Python datetime (with timezone) or nanoseconds since epoch serializes into an ISO8601 timestamp with nanoseconds."""
+    if isinstance(val, datetime):
+        val = datetime_to_nanos(val)
+    return to_human_timestamptz_ns(val)
+
+
 @to_json.register(FloatType)
 @to_json.register(DoubleType)
 def _(_: FloatType | DoubleType, val: float) -> float:
@@ -611,6 +631,26 @@ def _(_: TimestamptzType, val: str | int | datetime) -> datetime:
         return micros_to_timestamptz(val)
     else:
         return val
+
+
+@from_json.register(TimestampNanoType)
+def _(_: TimestampNanoType, val: str | int | datetime) -> int:
+    """JSON ISO8601 string into nanoseconds since epoch, since Python datetimes cannot hold nanoseconds."""
+    if isinstance(val, str):
+        return timestamp_to_nanos(val)
+    if isinstance(val, datetime):
+        return datetime_to_nanos(val)
+    return val
+
+
+@from_json.register(TimestamptzNanoType)
+def _(_: TimestamptzNanoType, val: str | int | datetime) -> int:
+    """JSON ISO8601 string into nanoseconds since epoch, since Python datetimes cannot hold nanoseconds."""
+    if isinstance(val, str):
+        return timestamptz_to_nanos(val)
+    if isinstance(val, datetime):
+        return datetime_to_nanos(val)
+    return val
 
 
 @from_json.register(FloatType)

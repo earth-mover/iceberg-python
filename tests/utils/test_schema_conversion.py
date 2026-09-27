@@ -33,7 +33,9 @@ from pyiceberg.types import (
     NestedField,
     StringType,
     StructType,
+    TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
     UnknownType,
     UUIDType,
 )
@@ -345,6 +347,28 @@ def test_convert_timestamp_micros_type() -> None:
     avro_logical_type = {"type": "int", "logicalType": "timestamp-micros"}
     actual = AvroSchemaConversion()._convert_logical_type(avro_logical_type)
     assert actual == TimestampType()
+
+
+@pytest.mark.parametrize(
+    "avro_logical_type, expected",
+    [
+        ({"type": "long", "logicalType": "timestamp-nanos"}, TimestampNanoType()),
+        ({"type": "long", "logicalType": "timestamp-nanos", "adjust-to-utc": False}, TimestampNanoType()),
+        ({"type": "long", "logicalType": "timestamp-nanos", "adjust-to-utc": True}, TimestamptzNanoType()),
+    ],
+)
+def test_convert_timestamp_nanos_type(avro_logical_type: dict[str, Any], expected: Any) -> None:
+    assert AvroSchemaConversion()._convert_logical_type(avro_logical_type) == expected
+
+
+def test_timestamp_nanos_avro_roundtrip() -> None:
+    schema = Schema(
+        NestedField(1, "ts_ns", TimestampNanoType(), required=True),
+        NestedField(2, "tstz_ns", TimestamptzNanoType(), required=True),
+    )
+    avro_schema = AvroSchemaConversion().iceberg_to_avro(schema)
+    assert isinstance(avro_schema, dict)
+    assert AvroSchemaConversion().avro_to_iceberg(avro_schema) == schema
 
 
 def test_unknown_logical_type() -> None:

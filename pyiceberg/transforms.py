@@ -62,6 +62,8 @@ from pyiceberg.expressions.literals import (
     Literal,
     LongLiteral,
     TimestampLiteral,
+    TimestampNanoLiteral,
+    TimestamptzNanoLiteral,
     literal,
 )
 from pyiceberg.typedef import IcebergRootModel, L
@@ -472,8 +474,10 @@ class YearTransform(TimeTransform[S]):
         elif isinstance(source, (TimestampNanoType, TimestamptzNanoType)):
 
             def year_func(v: Any) -> int:
-                # python datetime has no nanoseconds support.
-                # nanosecond datetimes will be expressed as int as a workaround
+                # python datetime has no nanoseconds support, so datetimes are converted with microsecond precision
+                if isinstance(v, py_datetime.datetime):
+                    v = datetime.datetime_to_nanos(v)
+
                 return datetime.nanos_to_years(v)
 
         else:
@@ -532,8 +536,10 @@ class MonthTransform(TimeTransform[S]):
         elif isinstance(source, (TimestampNanoType, TimestamptzNanoType)):
 
             def month_func(v: Any) -> int:
-                # python datetime has no nanoseconds support.
-                # nanosecond datetimes will be expressed as int as a workaround
+                # python datetime has no nanoseconds support, so datetimes are converted with microsecond precision
+                if isinstance(v, py_datetime.datetime):
+                    v = datetime.datetime_to_nanos(v)
+
                 return datetime.nanos_to_months(v)
 
         else:
@@ -593,8 +599,10 @@ class DayTransform(TimeTransform[S]):
         elif isinstance(source, (TimestampNanoType, TimestamptzNanoType)):
 
             def day_func(v: Any) -> int:
-                # python datetime has no nanoseconds support.
-                # nanosecond datetimes will be expressed as int as a workaround
+                # python datetime has no nanoseconds support, so datetimes are converted with microsecond precision
+                if isinstance(v, py_datetime.datetime):
+                    v = datetime.datetime_to_nanos(v)
+
                 return datetime.nanos_to_days(v)
 
         else:
@@ -654,8 +662,10 @@ class HourTransform(TimeTransform[S]):
         elif isinstance(source, (TimestampNanoType, TimestamptzNanoType)):
 
             def hour_func(v: Any) -> int:
-                # python datetime has no nanoseconds support.
-                # nanosecond datetimes will be expressed as int as a workaround
+                # python datetime has no nanoseconds support, so datetimes are converted with microsecond precision
+                if isinstance(v, py_datetime.datetime):
+                    v = datetime.datetime_to_nanos(v)
+
                 return datetime.nanos_to_hours(v)
 
         else:
@@ -955,6 +965,16 @@ def _(_type: IcebergType, value: int) -> str:
     return datetime.to_human_timestamptz(value)
 
 
+@_int_to_human_string.register(TimestampNanoType)
+def _(_type: IcebergType, value: int) -> str:
+    return datetime.to_human_timestamp_ns(value)
+
+
+@_int_to_human_string.register(TimestamptzNanoType)
+def _(_type: IcebergType, value: int) -> str:
+    return datetime.to_human_timestamptz_ns(value)
+
+
 class UnknownTransform(Transform[S, T]):
     """A transform that represents when an unknown transform is provided.
 
@@ -1036,7 +1056,9 @@ def _truncate_number(
 ) -> UnboundPredicate | None:
     boundary = pred.literal
 
-    if not isinstance(boundary, (LongLiteral, DecimalLiteral, DateLiteral, TimestampLiteral)):
+    if not isinstance(
+        boundary, (LongLiteral, DecimalLiteral, DateLiteral, TimestampLiteral, TimestampNanoLiteral, TimestamptzNanoLiteral)
+    ):
         raise ValueError(f"Expected a numeric literal, got: {type(boundary)}")
 
     if isinstance(pred, BoundLessThan):
@@ -1058,7 +1080,9 @@ def _truncate_number_strict(
 ) -> UnboundPredicate | None:
     boundary = pred.literal
 
-    if not isinstance(boundary, (LongLiteral, DecimalLiteral, DateLiteral, TimestampLiteral)):
+    if not isinstance(
+        boundary, (LongLiteral, DecimalLiteral, DateLiteral, TimestampLiteral, TimestampNanoLiteral, TimestamptzNanoLiteral)
+    ):
         raise ValueError(f"Expected a numeric literal, got: {type(boundary)}")
 
     if isinstance(pred, BoundLessThan):

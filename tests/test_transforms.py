@@ -17,7 +17,7 @@
 # under the License.
 # pylint: disable=eval-used,protected-access,redefined-outer-name
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
@@ -72,10 +72,11 @@ from pyiceberg.expressions.literals import (
     DateLiteral,
     DecimalLiteral,
     TimestampLiteral,
+    TimestampNanoLiteral,
     literal,
 )
 from pyiceberg.partitioning import _to_partition_representation
-from pyiceberg.schema import Accessor
+from pyiceberg.schema import Accessor, Schema
 from pyiceberg.transforms import (
     BucketTransform,
     DayTransform,
@@ -417,6 +418,8 @@ def test_satisfies_order_of_method(transform: TimeTransform[Any], other_transfor
         (TimeType(), 36775038194, "10:12:55.038194"),
         (TimestamptzType(), 1512151975038194, "2017-12-01T18:12:55.038194+00:00"),
         (TimestampType(), 1512151975038194, "2017-12-01T18:12:55.038194"),
+        (TimestampNanoType(), 1740342104375612001, "2025-02-23T20:21:44.375612001"),
+        (TimestamptzNanoType(), 1740342104375612001, "2025-02-23T20:21:44.375612001+00:00"),
         (LongType(), -1234567890000, "-1234567890000"),
         (StringType(), "a/b/c=d", "a/b/c=d"),
         (DecimalType(9, 2), Decimal("-1.50"), "-1.50"),
@@ -1734,3 +1737,52 @@ def test_calling_pyarrow_transform_without_pyiceberg_core_installed_correctly_ra
 
     with pytest.raises(NotInstalledError):
         transform.pyarrow_transform(StringType())
+
+
+@pytest.mark.parametrize(
+    "transform, expected",
+    [
+        (YearTransform(), 47),
+        (MonthTransform(), 574),
+        (DayTransform(), 17486),
+        (HourTransform(), 419686),
+        (BucketTransform(100), 7),
+    ],
+)
+@pytest.mark.parametrize("source_type", [TimestampNanoType(), TimestamptzNanoType()])
+def test_nano_transforms_accept_datetimes(transform: Transform[Any, int], expected: int, source_type: PrimitiveType) -> None:
+    value = datetime(2017, 11, 16, 22, 31, 8)
+    if isinstance(source_type, TimestamptzNanoType):
+        value = value.replace(tzinfo=timezone.utc)
+    nanos = 1510871468000000000
+    assert transform.transform(source_type)(value) == expected
+    assert transform.transform(source_type)(nanos) == expected
+
+
+NS_SCHEMA = Schema(NestedField(1, "ts_ns", TimestampNanoType(), required=False))
+
+
+@pytest.mark.parametrize(
+    "transform, expected",
+    [
+        (YearTransform(), GreaterThanOrEqual(term="part", literal=54)),
+        (MonthTransform(), GreaterThanOrEqual(term="part", literal=649)),
+        (DayTransform(), GreaterThanOrEqual(term="part", literal=19754)),
+        (HourTransform(), GreaterThanOrEqual(term="part", literal=474096)),
+        (IdentityTransform(), GreaterThanOrEqual(term="part", literal=TimestampNanoLiteral(1706745600000000001))),
+    ],
+)
+def test_projection_nano_timestamp(transform: Transform[Any, Any], expected: UnboundPredicate) -> None:
+    bound = GreaterThanOrEqual("ts_ns", "2024-02-01T00:00:00.000000001").bind(NS_SCHEMA)
+    assert transform.project("part", bound) == expected
+
+
+def test_projection_nano_timestamp_bucket_and_strict() -> None:
+    bound_eq = EqualTo("ts_ns", "2024-02-01T00:00:00.000000001").bind(NS_SCHEMA)
+    # Bucketing uses microseconds, so the sub-microsecond digits do not change the bucket
+    expected_bucket = BucketTransform(4).transform(TimestampType())(1706745600000000)
+    assert BucketTransform(4).project("part", bound_eq) == EqualTo(term="part", literal=expected_bucket)
+
+    bound_lt = LessThan("ts_ns", "2024-02-01T00:00:00").bind(NS_SCHEMA)
+    assert DayTransform().project("part", bound_lt) == LessThanOrEqual(term="part", literal=19753)
+    assert DayTransform().strict_project("part", bound_lt) == LessThan(term="part", literal=19754)

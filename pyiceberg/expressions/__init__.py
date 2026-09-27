@@ -30,7 +30,7 @@ from pydantic_core.core_schema import ValidatorFunctionWrapHandler
 from pyiceberg.expressions.literals import AboveMax, BelowMin, Literal, literal
 from pyiceberg.schema import Accessor, Schema
 from pyiceberg.typedef import IcebergBaseModel, IcebergRootModel, L, LiteralValue, StructProtocol
-from pyiceberg.types import DoubleType, FloatType, NestedField
+from pyiceberg.types import DoubleType, FloatType, GeographyType, GeometryType, NestedField
 from pyiceberg.utils.singleton import Singleton
 
 
@@ -908,7 +908,13 @@ class LiteralPredicate(UnboundPredicate, ABC):
 
     def bind(self, schema: Schema, case_sensitive: bool = True) -> BoundLiteralPredicate:
         bound_term = self.term.bind(schema, case_sensitive)
-        lit = self.literal.to(bound_term.ref().field.field_type)
+        field_type = bound_term.ref().field.field_type
+        if isinstance(field_type, (GeometryType, GeographyType)) and not isinstance(self, (EqualTo, NotEqualTo)):
+            raise ValueError(
+                f"{self.__class__.__name__} is not supported for {field_type} column {bound_term.ref().field.name}: "
+                "geometry and geography values have no ordering, only (not) equal to, (not) in and (not) null are supported"
+            )
+        lit = self.literal.to(field_type)
 
         if isinstance(lit, AboveMax):
             if isinstance(self, (LessThan, LessThanOrEqual, NotEqualTo)):

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
 from pathlib import PosixPath
 from typing import Any
 
@@ -25,11 +26,13 @@ from pyiceberg.conversions import to_bytes
 from pyiceberg.manifest import DataFile, DataFileContent
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.table import Table
 from pyiceberg.table.inspect import InspectTable, _readable_bound
+from pyiceberg.table.metadata import TableMetadataV3
 from pyiceberg.table.snapshots import Snapshot
 from pyiceberg.transforms import IdentityTransform
 from pyiceberg.typedef import Record
-from pyiceberg.types import NestedField, StringType
+from pyiceberg.types import BinaryType, GeographyType, GeometryType, NestedField, StringType, UnknownType
 from tests.catalog.test_base import InMemoryCatalog
 
 
@@ -106,3 +109,46 @@ def test_inspect_manifests_preserves_empty_string_bounds(catalog: InMemoryCatalo
     partition_summary = tbl.inspect.manifests().to_pydict()["partition_summaries"][0][0]
     assert partition_summary["lower_bound"] == ""
     assert partition_summary["upper_bound"] == ""
+
+
+def test_readable_bound_for_unknown_type() -> None:
+    assert _readable_bound(UnknownType(), b"\x00") is None
+
+
+def test_inspect_entries_and_files_with_geo_columns(catalog: InMemoryCatalog) -> None:
+    wkb_point = bytes.fromhex("0101000000000000000000f03f0000000000000040")
+    binary_schema = Schema(
+        NestedField(1, "geom", BinaryType(), required=False),
+        NestedField(2, "geog", BinaryType(), required=False),
+    )
+    # v3 tables cannot be written yet, so write WKB as binary and read the files back through v3 metadata that
+    # declares the columns as geometry/geography, like a table written by another engine
+    tbl = catalog.create_table("default.geo", binary_schema)
+    tbl.append(pa.table({"geom": [wkb_point, None], "geog": [wkb_point, None]}, schema=binary_schema.as_arrow()))
+    geo_schema = Schema(
+        NestedField(1, "geom", GeometryType("srid:3857"), required=False),
+        NestedField(2, "geog", GeographyType("srid:4326", "vincenty"), required=False),
+    )
+    metadata = json.loads(tbl.metadata.model_dump_json())
+    metadata.update({"format-version": 3, "next-row-id": 2, "schemas": [json.loads(geo_schema.model_dump_json())]})
+    geo_tbl = Table(
+        identifier=("default", "geo"),
+        metadata=TableMetadataV3.model_validate(metadata),
+        metadata_location=tbl.metadata_location,
+        io=tbl.io,
+        catalog=catalog,
+    )
+
+    for inspect_table in (geo_tbl.inspect.files(), geo_tbl.inspect.entries(), geo_tbl.inspect.all_files()):
+        readable_metrics = inspect_table.to_pydict()["readable_metrics"][0]
+        for column in ("geom", "geog"):
+            metrics_type = inspect_table.schema.field("readable_metrics").type.field(column).type
+            assert metrics_type.field("lower_bound").type == pa.binary()
+            assert metrics_type.field("upper_bound").type == pa.binary()
+            assert readable_metrics[column]["value_count"] == 2
+            assert readable_metrics[column]["null_value_count"] == 1
+
+    geom = geo_tbl.scan().to_arrow().column("geom")
+    if isinstance(geom.type, pa.ExtensionType):
+        geom = geom.cast(geom.type.storage_type)
+    assert geom.to_pylist() == [wkb_point, None]

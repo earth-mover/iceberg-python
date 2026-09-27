@@ -37,6 +37,7 @@ from pyiceberg.io.pyarrow import (
     _ConvertToIceberg,
     _ConvertToIcebergWithoutIDs,
     _expression_to_complementary_pyarrow,
+    _geoarrow_crs_to_iceberg,
     _HasIds,
     _NullNaNUnmentionedTermsCollector,
     _pyarrow_schema_ensure_large_types,
@@ -55,6 +56,8 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IcebergType,
     IntegerType,
     ListType,
@@ -76,6 +79,65 @@ def test_pyarrow_binary_to_iceberg() -> None:
     converted_iceberg_type = visit_pyarrow(pyarrow_type, _ConvertToIceberg())
     assert converted_iceberg_type == FixedType(length)
     assert visit(converted_iceberg_type, _ConvertToArrowSchema()) == pyarrow_type
+
+
+class _GeoArrowWkbLike(pa.ExtensionType):
+    """Unregistered stand-in for the geoarrow.wkb extension type, usable without geoarrow-pyarrow."""
+
+    def __init__(self, metadata: bytes) -> None:
+        self._metadata = metadata
+        super().__init__(pa.binary(), "geoarrow.wkb")
+
+    def __arrow_ext_serialize__(self) -> bytes:
+        return self._metadata
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type: pa.DataType, serialized: bytes) -> "_GeoArrowWkbLike":
+        return cls(serialized)
+
+
+@pytest.mark.parametrize(
+    "metadata, expected",
+    [
+        (b"", GeometryType()),
+        (b"{}", GeometryType()),
+        (b'{"crs": "srid:3857"}', GeometryType("srid:3857")),
+        (b'{"crs": "OGC:CRS84", "edges": "planar"}', GeometryType()),
+        (b'{"crs": {"id": {"authority": "EPSG", "code": 3857}}}', GeometryType("EPSG:3857")),
+        (b'{"edges": "spherical"}', GeographyType()),
+        (b'{"crs": "srid:4326", "edges": "vincenty"}', GeographyType("srid:4326", "vincenty")),
+    ],
+)
+def test_pyarrow_geoarrow_wkb_to_iceberg(metadata: bytes, expected: IcebergType) -> None:
+    assert visit_pyarrow(_GeoArrowWkbLike(metadata), _ConvertToIceberg()) == expected
+
+
+def test_pyarrow_geoarrow_wkb_unsupported_edges() -> None:
+    with pytest.raises(TypeError, match="Unsupported GeoArrow edge type: bogus"):
+        visit_pyarrow(_GeoArrowWkbLike(b'{"edges": "bogus"}'), _ConvertToIceberg())
+
+
+def test_geoarrow_projjson_crs_without_id() -> None:
+    with pytest.raises(TypeError, match="Unsupported GeoArrow CRS"):
+        _geoarrow_crs_to_iceberg({"type": "GeographicCRS"})
+
+
+@pytest.mark.parametrize(
+    "iceberg_type",
+    [
+        GeometryType(),
+        GeometryType("srid:3857"),
+        GeographyType(),
+        GeographyType("srid:4326"),
+        GeographyType("srid:4326", "vincenty"),
+        GeographyType("OGC:CRS84", "karney"),
+    ],
+)
+def test_geoarrow_round_trip(iceberg_type: IcebergType) -> None:
+    pytest.importorskip("geoarrow.pyarrow")
+    arrow_type = schema_to_pyarrow(iceberg_type)
+    assert arrow_type.extension_name == "geoarrow.wkb"
+    assert visit_pyarrow(arrow_type, _ConvertToIceberg()) == iceberg_type
 
 
 def test_pyarrow_decimal128_to_iceberg() -> None:

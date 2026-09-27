@@ -43,6 +43,7 @@ from pyiceberg.avro import (
     STRUCT_INT32,
     STRUCT_INT64,
 )
+from pyiceberg.conversions import from_bytes
 from pyiceberg.io.pyarrow import (
     MetricModeTypes,
     MetricsMode,
@@ -65,7 +66,10 @@ from pyiceberg.types import (
     BooleanType,
     FloatType,
     IntegerType,
+    NestedField,
     StringType,
+    TimestampNanoType,
+    TimestamptzNanoType,
 )
 from pyiceberg.utils.datetime import date_to_days, datetime_to_micros, time_to_micros
 
@@ -746,6 +750,43 @@ def test_read_missing_statistics() -> None:
     assert datafile.upper_bounds[string_col_idx].decode() == "zzzzzzzzzzzzzzz{"
     assert len(datafile.null_value_counts) == 1
     assert datafile.null_value_counts[string_col_idx] == 1
+
+
+def test_nano_timestamp_bounds_keep_nanosecond_precision() -> None:
+    schema = Schema(
+        NestedField(1, "ts_ns", TimestampNanoType(), required=False),
+        NestedField(2, "tstz_ns", TimestamptzNanoType(), required=False),
+        NestedField(3, "ts_ns_as_us", TimestampNanoType(), required=False),
+    )
+    arrow_schema = schema_to_pyarrow(schema)
+    # A file written with downcast-ns-timestamp-to-us-on-write stores microseconds for a timestamp_ns column
+    arrow_schema = arrow_schema.set(2, arrow_schema.field(2).with_type(pa.timestamp("us")))
+    table = pa.Table.from_pydict(
+        {
+            "ts_ns": [1704067200123456789, None, 1706832000000000001],
+            "tstz_ns": [1704067200123456789, None, 1706832000000000001],
+            "ts_ns_as_us": [1704067200123456, None, 1706832000000001],
+        },
+        schema=arrow_schema,
+    )
+
+    metadata_collector: list[Any] = []
+    with pa.BufferOutputStream() as f:
+        with pq.ParquetWriter(f, table.schema, metadata_collector=metadata_collector) as writer:
+            writer.write_table(table)
+
+    statistics = data_file_statistics_from_parquet_metadata(
+        parquet_metadata=metadata_collector[0],
+        stats_columns=compute_statistics_plan(schema, {}),
+        parquet_column_mapping=parquet_path_to_id_mapping(schema),
+    )
+    datafile = DataFile.from_args(**statistics.to_serialized_dict())
+
+    for field_id in (1, 2):
+        assert from_bytes(TimestampNanoType(), datafile.lower_bounds[field_id]) == 1704067200123456789
+        assert from_bytes(TimestampNanoType(), datafile.upper_bounds[field_id]) == 1706832000000000001
+    assert from_bytes(TimestampNanoType(), datafile.lower_bounds[3]) == 1704067200123456000
+    assert from_bytes(TimestampNanoType(), datafile.upper_bounds[3]) == 1706832000000001000
 
 
 # This is commented out for now because write_to_dataset drops the partition

@@ -36,10 +36,10 @@ than silently producing incompatible files.
 | Deletion vectors (Puffin) | Yes | No | Read support decodes every blob in the file. |
 | Position delete files (v2 style) | Yes | No | |
 | Equality deletes | No | No | |
-| `timestamp_ns` / `timestamptz_ns` | Yes | No | Values are read with nanosecond precision. Predicates on nanosecond columns are not yet supported. |
+| `timestamp_ns` / `timestamptz_ns` | Yes | No | Values are read with nanosecond precision. Row filters and partition pruning work on nanosecond columns. |
 | `unknown` | Yes | No | Reads as null. |
 | `variant` | No | No | Tables with a variant column cannot be loaded yet. |
-| `geometry` / `geography` | Partial | No | Types with the default CRS parse; the spec form `geometry(srid:3857)` does not yet. See [Geospatial types](geospatial.md). |
+| `geometry` / `geography` | Yes | No | Type strings are parsed and serialized in the Java/spec form, e.g. `geometry(srid:3857)`. Only equality and null predicates are supported, and bounds are not used to skip files. See [Geospatial types](geospatial.md). |
 | Default values (`initial-default`, `write-default`) | Yes | Partial | `initial-default` is applied on read. |
 | Multi-argument transforms | No | No | Loading a table whose spec uses `source-ids` with more than one id raises. |
 | Table encryption | Metadata only | No | `encryption-keys` and `key-id` round-trip through metadata. |
@@ -66,3 +66,16 @@ v1 and v2 tables.
 On v3 tables, PyArrow `timestamp('ns')` columns map to `timestamp_ns` / `timestamptz_ns` and are read back at full
 precision. On v1 and v2 tables nanosecond input must be downcast with the `downcast-ns-timestamp-to-us-on-write`
 property (see [Configuration](configuration.md#nanoseconds-support)).
+
+Row filters on nanosecond columns accept ISO-8601 strings with up to nine fractional digits, integers (nanoseconds
+since the epoch), `date` and `datetime` values. Python `datetime` objects only hold microseconds, so use a string or an
+integer to filter on sub-microsecond values:
+
+```python
+from pyiceberg.expressions import GreaterThanOrEqual
+
+table.scan(row_filter=GreaterThanOrEqual("ts_ns", "2024-01-01T00:00:00.123456789"))
+table.scan(row_filter=GreaterThanOrEqual("tstz_ns", "2024-01-01T00:00:00.123456789+00:00"))
+```
+
+As with microsecond timestamps, `timestamptz_ns` filters require a zone offset and `timestamp_ns` filters reject one.

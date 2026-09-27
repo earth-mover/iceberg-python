@@ -50,7 +50,7 @@ from pyiceberg.table.update import (
     UpdateTableMetadata,
 )
 from pyiceberg.typedef import L, TableVersion
-from pyiceberg.types import IcebergType, ListType, MapType, NestedField, PrimitiveType, StructType
+from pyiceberg.types import GeographyType, GeometryType, IcebergType, ListType, MapType, NestedField, PrimitiveType, StructType
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -470,6 +470,9 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
                 raise ValidationError(f"Cannot change column type: {field.field_type} is not a primitive")
 
             if not self._allow_incompatible_changes and field.field_type != field_type:
+                if isinstance(field_type, (GeometryType, GeographyType)):
+                    # promote() accepts binary -> geometry/geography only to resolve file schemas on read
+                    raise ValidationError(f"Cannot change column type: {full_name}: {field.field_type} -> {field_type}")
                 try:
                     promote(field.field_type, field_type)
                 except ResolveError as e:

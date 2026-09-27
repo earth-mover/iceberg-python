@@ -36,6 +36,8 @@ from pyiceberg.expressions.literals import (
     FloatAboveMax,
     FloatBelowMin,
     FloatLiteral,
+    GeographyLiteral,
+    GeometryLiteral,
     IntAboveMax,
     IntBelowMin,
     Literal,
@@ -45,6 +47,8 @@ from pyiceberg.expressions.literals import (
     StringLiteral,
     TimeLiteral,
     TimestampLiteral,
+    TimestampNanoLiteral,
+    TimestamptzNanoLiteral,
     literal,
 )
 from pyiceberg.types import (
@@ -55,11 +59,15 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IntegerType,
     LongType,
     PrimitiveType,
     StringType,
+    TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
     TimestamptzType,
     TimeType,
     UUIDType,
@@ -385,6 +393,84 @@ def test_invalid_timestamp_with_zone_in_literal() -> None:
     with pytest.raises(ValueError) as e:
         _ = timestamp_str.to(TimestampType())
     assert "Invalid timestamp without zone: abc (must be ISO-8601)" in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "value, iceberg_type, expected",
+    [
+        ("2024-01-01T00:00:00.123456789", TimestampNanoType(), 1704067200123456789),
+        ("2024-01-01T00:00:00.1234567", TimestampNanoType(), 1704067200123456700),
+        ("2024-01-01T00:00:00.123456", TimestampNanoType(), 1704067200123456000),
+        ("2024-01-01T00:00:00", TimestampNanoType(), 1704067200000000000),
+        ("1969-12-31T23:59:59.999999999", TimestampNanoType(), -1),
+        ("2024-01-01T00:00:00.123456789+00:00", TimestamptzNanoType(), 1704067200123456789),
+        ("2024-01-01T01:00:00.123456789+01:00", TimestamptzNanoType(), 1704067200123456789),
+    ],
+)
+def test_string_to_timestamp_nano_literal(value: str, iceberg_type: PrimitiveType, expected: int) -> None:
+    lit = literal(value).to(iceberg_type)
+    expected_type = TimestampNanoLiteral if isinstance(iceberg_type, TimestampNanoType) else TimestamptzNanoLiteral
+    assert type(lit) is expected_type
+    assert lit.value == expected
+
+
+def test_string_to_timestamp_nano_literal_zone_errors() -> None:
+    with pytest.raises(ValueError, match="Zone offset provided, but not expected"):
+        literal("2024-01-01T00:00:00.123456789+00:00").to(TimestampNanoType())
+    with pytest.raises(ValueError, match="Missing zone offset"):
+        literal("2024-01-01T00:00:00.123456789").to(TimestamptzNanoType())
+    with pytest.raises(ValueError, match="Invalid timestamp without zone"):
+        literal("abc").to(TimestampNanoType())
+    with pytest.raises(ValueError, match="Invalid timestamp with zone"):
+        literal("abc").to(TimestamptzNanoType())
+
+
+@pytest.mark.parametrize("iceberg_type", [TimestampNanoType(), TimestamptzNanoType()])
+def test_timestamp_nano_literal_above_and_below_max(iceberg_type: PrimitiveType) -> None:
+    zone = "+00:00" if isinstance(iceberg_type, TimestamptzNanoType) else ""
+    assert literal(f"2262-04-12T00:00:00{zone}").to(iceberg_type) == LongAboveMax()
+    assert literal(f"1677-09-21T00:00:00{zone}").to(iceberg_type) == LongBelowMin()
+    assert LongLiteral(LongType.max + 1).to(iceberg_type) == LongAboveMax()
+    assert LongLiteral(LongType.min - 1).to(iceberg_type) == LongBelowMin()
+    assert TimestampLiteral(LongType.max // 1_000 + 1).to(iceberg_type) == LongAboveMax()
+    assert DateLiteral(-106752).to(iceberg_type) == LongBelowMin()
+
+
+def test_timestamp_nano_literal_conversions() -> None:
+    nanos = 1704067200123456789
+    assert LongLiteral(nanos).to(TimestampNanoType()) == TimestampNanoLiteral(nanos)
+    assert type(LongLiteral(nanos).to(TimestamptzNanoType())) is TimestamptzNanoLiteral
+    assert TimestampLiteral(1704067200123456).to(TimestampNanoType()) == TimestampNanoLiteral(1704067200123456000)
+    assert type(TimestampLiteral(1704067200123456).to(TimestamptzNanoType())) is TimestamptzNanoLiteral
+    assert DateLiteral(19723).to(TimestampNanoType()) == TimestampNanoLiteral(1704067200000000000)
+    assert type(DateLiteral(19723).to(TimestamptzNanoType())) is TimestamptzNanoLiteral
+
+    lit = TimestampNanoLiteral(nanos)
+    assert lit.to(TimestampNanoType()) is lit
+    assert type(lit.to(TimestamptzNanoType())) is TimestamptzNanoLiteral
+    assert lit.to(TimestampType()) == TimestampLiteral(1704067200123456)
+    assert lit.to(TimestamptzType()) == TimestampLiteral(1704067200123456)
+    assert lit.to(DateType()) == DateLiteral(19723)
+    # Conversion to micros and days floors, including before the epoch
+    assert TimestampNanoLiteral(-1).to(TimestampType()) == TimestampLiteral(-1)
+    assert TimestampNanoLiteral(-1).to(DateType()) == DateLiteral(-1)
+
+    tz_lit = TimestamptzNanoLiteral(nanos)
+    assert tz_lit.to(TimestamptzNanoType()) is tz_lit
+    assert type(tz_lit.to(TimestampNanoType())) is TimestampNanoLiteral
+
+    assert lit.increment() == TimestampNanoLiteral(nanos + 1)
+    assert lit.decrement() == TimestampNanoLiteral(nanos - 1)
+    assert type(tz_lit.increment()) is TimestamptzNanoLiteral
+    assert type(tz_lit.decrement()) is TimestamptzNanoLiteral
+
+    with pytest.raises(TypeError, match="Cannot convert TimestampNanoLiteral into string"):
+        lit.to(StringType())
+
+
+def test_timestamp_nano_literal_serialization() -> None:
+    assert TimestampNanoLiteral(1704067200123456789).model_dump() == "2024-01-01T00:00:00.123456789"
+    assert TimestamptzNanoLiteral(1704067200123456789).model_dump() == "2024-01-01T00:00:00.123456789+00:00"
 
 
 def test_string_to_uuid_literal() -> None:
@@ -1030,3 +1116,31 @@ assert_type(literal(123.4), Literal[float])
 assert_type(literal(bytes([0x01, 0x02, 0x03])), Literal[bytes])
 assert_type(literal(Decimal("19.25")), Literal[Decimal])
 assert_type({literal(1), literal(2), literal(3)}, set[Literal[int]])
+
+
+WKB_POINT = bytes.fromhex("0101000000000000000000f03f0000000000000040")
+
+
+def test_binary_to_geometry() -> None:
+    geometry_lit = literal(WKB_POINT).to(GeometryType("srid:3857"))
+    assert isinstance(geometry_lit, GeometryLiteral)
+    assert geometry_lit.value == WKB_POINT
+    assert geometry_lit.to(GeometryType()) is geometry_lit
+    assert geometry_lit.to(BinaryType()) == BinaryLiteral(WKB_POINT)
+    with pytest.raises(TypeError, match="Cannot convert GeometryLiteral into geography"):
+        geometry_lit.to(GeographyType())
+
+
+def test_binary_to_geography() -> None:
+    geography_lit = literal(WKB_POINT).to(GeographyType("srid:4326", "vincenty"))
+    assert isinstance(geography_lit, GeographyLiteral)
+    assert geography_lit.value == WKB_POINT
+    assert geography_lit.to(GeographyType()) is geography_lit
+    assert geography_lit.to(BinaryType()) == BinaryLiteral(WKB_POINT)
+    with pytest.raises(TypeError, match="Cannot convert GeographyLiteral into geometry"):
+        geography_lit.to(GeometryType())
+
+
+def test_string_to_geometry_is_not_supported() -> None:
+    with pytest.raises(TypeError, match="Cannot convert StringLiteral into geometry"):
+        literal("POINT (1 2)").to(GeometryType())

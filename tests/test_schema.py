@@ -44,6 +44,8 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IcebergType,
     IntegerType,
     ListType,
@@ -972,6 +974,23 @@ def test_decimal_promotion() -> None:
     # Reducing the precision is not allowed.
     with pytest.raises(ResolveError):
         promote(DecimalType(18, 2), DecimalType(9, 2))
+
+
+@pytest.mark.parametrize("read_type", [GeometryType(), GeometryType("srid:3857"), GeographyType("srid:4326", "vincenty")])
+def test_binary_resolves_to_geo_types(read_type: IcebergType) -> None:
+    # Parquet GEOMETRY/GEOGRAPHY columns are reported as binary by PyArrow
+    assert promote(BinaryType(), read_type) == read_type
+    with pytest.raises(ResolveError):
+        promote(StringType(), read_type)
+    with pytest.raises(ResolveError):
+        promote(FixedType(16), read_type)
+
+
+def test_update_column_binary_to_geometry_is_rejected(table_v2: Table) -> None:
+    current_schema = Schema(NestedField(field_id=1, name="aCol", field_type=BinaryType(), required=False))
+    update = UpdateSchema(transaction=Transaction(table_v2), schema=current_schema)
+    with pytest.raises(ValidationError, match="Cannot change column type: aCol: binary -> geometry"):
+        update.update_column("aCol", GeometryType())
 
 
 def test_unknown_type_promotion_to_primitive() -> None:

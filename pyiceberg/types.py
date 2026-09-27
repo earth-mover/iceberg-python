@@ -66,11 +66,16 @@ DEFAULT_GEOMETRY_CRS = "OGC:CRS84"
 DEFAULT_GEOGRAPHY_CRS = "OGC:CRS84"
 DEFAULT_GEOGRAPHY_ALGORITHM = "spherical"
 
-# Regex patterns for parsing geometry and geography type strings
-# Matches: geometry, geometry('CRS'), geometry('crs'), geometry("CRS")
-GEOMETRY_REGEX = re.compile(r"geometry(?:\(\s*['\"]([^'\"]+)['\"]\s*\))?$")
-# Matches: geography, geography('CRS'), geography('crs', 'algo')
-GEOGRAPHY_REGEX = re.compile(r"geography(?:\(\s*['\"]([^'\"]+)['\"](?:\s*,\s*['\"]([^'\"]+)['\"])?\s*\))?$")
+GEOGRAPHY_ALGORITHMS = frozenset({"spherical", "vincenty", "thomas", "andoyer", "karney"})
+
+# Regex patterns for parsing geometry and geography type strings, compatible with the Java implementation.
+# Values are unquoted in the spec form (geometry(srid:3857), geography(srid:4326, vincenty)); single- or
+# double-quoted values are also accepted because older PyIceberg versions wrote them that way.
+GEOMETRY_REGEX = re.compile(r"""^geometry\s*(?:\(\s*(?:'([^']*)'|"([^"]*)"|([^)]*?))\s*\))?$""", re.IGNORECASE)
+GEOGRAPHY_REGEX = re.compile(
+    r"""^geography\s*(?:\(\s*(?:'([^']*)'|"([^"]*)"|([^,)]*?))\s*(?:,\s*(?:'(\w*)'|"(\w*)"|(\w*))\s*)?\))?$""",
+    re.IGNORECASE,
+)
 
 
 def transform_dict_value_to_str(d: dict[str, Any]) -> dict[str, str]:
@@ -105,6 +110,14 @@ def _parse_fixed_type(fixed: Any) -> int:
         return fixed
 
 
+def _first_group(match: re.Match[str], *groups: int) -> str | None:
+    """Return the first non-empty capture group among the given group indices."""
+    for group in groups:
+        if value := match.group(group):
+            return value
+    return None
+
+
 def _parse_geometry_type(geometry: Any) -> str:
     """Parse geometry type string and return CRS.
 
@@ -115,16 +128,25 @@ def _parse_geometry_type(geometry: Any) -> str:
         The CRS string (defaults to DEFAULT_GEOMETRY_CRS if not specified).
     """
     if isinstance(geometry, str):
-        match = GEOMETRY_REGEX.match(geometry)
+        match = GEOMETRY_REGEX.match(geometry.strip())
         if match:
-            crs = match.group(1)
-            return crs if crs else DEFAULT_GEOMETRY_CRS
+            return _first_group(match, 1, 2, 3) or DEFAULT_GEOMETRY_CRS
         else:
             raise ValidationError(f"Could not parse {geometry} into a GeometryType")
     elif isinstance(geometry, dict):
         return geometry.get("crs", DEFAULT_GEOMETRY_CRS)
     else:
         return geometry
+
+
+def _validate_geography_algorithm(algorithm: str) -> str:
+    """Lower-case the edge-interpolation algorithm and check that the spec allows it."""
+    normalized = algorithm.lower()
+    if normalized not in GEOGRAPHY_ALGORITHMS:
+        raise ValidationError(
+            f"Invalid geography edge algorithm: {algorithm}, must be one of: {', '.join(sorted(GEOGRAPHY_ALGORITHMS))}"
+        )
+    return normalized
 
 
 def _parse_geography_type(geography: Any) -> tuple[str, str]:
@@ -137,17 +159,17 @@ def _parse_geography_type(geography: Any) -> tuple[str, str]:
         Tuple of (CRS, algorithm) with defaults applied where not specified.
     """
     if isinstance(geography, str):
-        match = GEOGRAPHY_REGEX.match(geography)
+        match = GEOGRAPHY_REGEX.match(geography.strip())
         if match:
-            crs = match.group(1) if match.group(1) else DEFAULT_GEOGRAPHY_CRS
-            algorithm = match.group(2) if match.group(2) else DEFAULT_GEOGRAPHY_ALGORITHM
-            return crs, algorithm
+            crs = _first_group(match, 1, 2, 3) or DEFAULT_GEOGRAPHY_CRS
+            algorithm = _first_group(match, 4, 5, 6) or DEFAULT_GEOGRAPHY_ALGORITHM
+            return crs, _validate_geography_algorithm(algorithm)
         else:
             raise ValidationError(f"Could not parse {geography} into a GeographyType")
     elif isinstance(geography, dict):
         crs = geography.get("crs", DEFAULT_GEOGRAPHY_CRS)
         algorithm = geography.get("algorithm", DEFAULT_GEOGRAPHY_ALGORITHM)
-        return crs, algorithm
+        return crs, _validate_geography_algorithm(algorithm)
     else:
         return geography
 
@@ -188,9 +210,9 @@ class IcebergType(IcebergBaseModel):
             # a CRS string (or CRS, algorithm tuple). If we try to parse those as type
             # strings here, we'd re-enter this validator (or raise) instead of letting
             # pydantic validate the raw root values.
-            if cls.__name__ == "GeometryType" and not v.startswith("geometry"):
+            if cls.__name__ == "GeometryType" and not v.lower().startswith("geometry"):
                 return handler(v)
-            if cls.__name__ == "GeographyType" and not v.startswith("geography"):
+            if cls.__name__ == "GeographyType" and not v.lower().startswith("geography"):
                 return handler(v)
 
             if v == "boolean":
@@ -228,10 +250,10 @@ class IcebergType(IcebergBaseModel):
             if v.startswith("decimal"):
                 precision, scale = _parse_decimal_type(v)
                 return DecimalType(precision, scale)
-            if v.startswith("geometry"):
+            if v.lower().startswith("geometry"):
                 crs = _parse_geometry_type(v)
                 return GeometryType(crs)
-            if v.startswith("geography"):
+            if v.lower().startswith("geography"):
                 crs, algorithm = _parse_geography_type(v)
                 return GeographyType(crs, algorithm)
             else:
@@ -990,7 +1012,7 @@ class GeometryType(PrimitiveType):
         >>> GeometryType("EPSG:4326")
         GeometryType(crs='EPSG:4326')
         >>> str(GeometryType("EPSG:4326"))
-        "geometry('EPSG:4326')"
+        'geometry(EPSG:4326)'
     """
 
     root: str = Field(default=DEFAULT_GEOMETRY_CRS)
@@ -1000,10 +1022,10 @@ class GeometryType(PrimitiveType):
 
     @model_serializer
     def ser_model(self) -> str:
-        """Serialize the model to a string."""
+        """Serialize the model to the spec (and Java) form, e.g. geometry(srid:3857)."""
         if self.crs == DEFAULT_GEOMETRY_CRS:
             return "geometry"
-        return f"geometry('{self.crs}')"
+        return f"geometry({self.crs})"
 
     @property
     def crs(self) -> str:
@@ -1018,9 +1040,7 @@ class GeometryType(PrimitiveType):
 
     def __str__(self) -> str:
         """Return the string representation."""
-        if self.crs == DEFAULT_GEOMETRY_CRS:
-            return "geometry"
-        return f"geometry('{self.crs}')"
+        return self.ser_model()
 
     def __hash__(self) -> int:
         """Return the hash of the CRS."""
@@ -1056,10 +1076,10 @@ class GeographyType(PrimitiveType):
         'OGC:CRS84'
         >>> column_foo.algorithm
         'spherical'
-        >>> GeographyType("EPSG:4326", "planar")
-        GeographyType(crs='EPSG:4326', algorithm='planar')
-        >>> str(GeographyType("EPSG:4326", "planar"))
-        "geography('EPSG:4326', 'planar')"
+        >>> GeographyType("EPSG:4326", "vincenty")
+        GeographyType(crs='EPSG:4326', algorithm='vincenty')
+        >>> str(GeographyType("EPSG:4326", "vincenty"))
+        'geography(EPSG:4326, vincenty)'
     """
 
     root: tuple[str, str] = Field(default=(DEFAULT_GEOGRAPHY_CRS, DEFAULT_GEOGRAPHY_ALGORITHM))
@@ -1069,12 +1089,12 @@ class GeographyType(PrimitiveType):
 
     @model_serializer
     def ser_model(self) -> str:
-        """Serialize the model to a string."""
+        """Serialize the model to the spec (and Java) form, e.g. geography(srid:4326, vincenty)."""
         if self.crs == DEFAULT_GEOGRAPHY_CRS and self.algorithm == DEFAULT_GEOGRAPHY_ALGORITHM:
             return "geography"
         if self.algorithm == DEFAULT_GEOGRAPHY_ALGORITHM:
-            return f"geography('{self.crs}')"
-        return f"geography('{self.crs}', '{self.algorithm}')"
+            return f"geography({self.crs})"
+        return f"geography({self.crs}, {self.algorithm})"
 
     @property
     def crs(self) -> str:
@@ -1096,11 +1116,7 @@ class GeographyType(PrimitiveType):
 
     def __str__(self) -> str:
         """Return the string representation."""
-        if self.crs == DEFAULT_GEOGRAPHY_CRS and self.algorithm == DEFAULT_GEOGRAPHY_ALGORITHM:
-            return "geography"
-        if self.algorithm == DEFAULT_GEOGRAPHY_ALGORITHM:
-            return f"geography('{self.crs}')"
-        return f"geography('{self.crs}', '{self.algorithm}')"
+        return self.ser_model()
 
     def __hash__(self) -> int:
         """Return the hash of the tuple."""

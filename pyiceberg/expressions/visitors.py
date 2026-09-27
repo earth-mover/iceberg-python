@@ -61,6 +61,8 @@ from pyiceberg.typedef import EMPTY_DICT, L, LiteralValue, Record, StructProtoco
 from pyiceberg.types import (
     DoubleType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IcebergType,
     NestedField,
     PrimitiveType,
@@ -1179,6 +1181,17 @@ class _MetricsEvaluationVisitor(BoundBooleanExpressionVisitor[bool], ABC):
             return False
 
 
+def _is_geo_predicate(predicate: BoundPredicate) -> bool:
+    """Return whether a literal or set predicate references a geometry or geography column.
+
+    The lower and upper bounds of geo columns are bounding-box corner points rather than ordered values, so
+    they cannot be compared with a literal; only the null and value counts can be used for these predicates.
+    """
+    return isinstance(predicate, (BoundLiteralPredicate, BoundSetPredicate)) and isinstance(
+        predicate.term.ref().field.field_type, (GeometryType, GeographyType)
+    )
+
+
 class _InclusiveMetricsEvaluator:
     """Bind an inclusive metrics expression once and evaluate files without mutating prepared state."""
 
@@ -1207,6 +1220,13 @@ class _InclusiveMetricsEvaluator:
 
 class _InclusiveMetricsEvaluationVisitor(_MetricsEvaluationVisitor):
     """Evaluate inclusive metrics for one data file."""
+
+    def visit_bound_predicate(self, predicate: BoundPredicate) -> bool:
+        if _is_geo_predicate(predicate):
+            if isinstance(predicate, (BoundEqualTo, BoundIn)) and self._contains_nulls_only(predicate.term.ref().field.field_id):
+                return ROWS_CANNOT_MATCH
+            return ROWS_MIGHT_MATCH
+        return super().visit_bound_predicate(predicate)
 
     def _may_contain_null(self, field_id: int) -> bool:
         # A missing null count means the count is unknown, so the column may contain nulls.
@@ -1557,6 +1577,15 @@ class _StrictMetricsEvaluationVisitor(_MetricsEvaluationVisitor):
     def __init__(self, struct: StructType, file: DataFile) -> None:
         super().__init__(file)
         self.struct = struct
+
+    def visit_bound_predicate(self, predicate: BoundPredicate) -> bool:
+        if _is_geo_predicate(predicate):
+            if isinstance(predicate, (BoundNotEqualTo, BoundNotIn)) and self._contains_nulls_only(
+                predicate.term.ref().field.field_id
+            ):
+                return ROWS_MUST_MATCH
+            return ROWS_MIGHT_NOT_MATCH
+        return super().visit_bound_predicate(predicate)
 
     def visit_is_null(self, term: BoundTerm) -> bool:
         # no need to check whether the field is required because binding evaluates that case

@@ -1687,6 +1687,10 @@ def _(file_type: StringType, read_type: IcebergType) -> IcebergType:
 def _(file_type: BinaryType, read_type: IcebergType) -> IcebergType:
     if isinstance(read_type, StringType):
         return read_type
+    elif isinstance(read_type, (GeometryType, GeographyType)):
+        # Like fixed -> uuid, this is a read-time resolution rule rather than a schema evolution: geometry and
+        # geography values are stored as WKB, and PyArrow reports Parquet GEOMETRY/GEOGRAPHY columns as binary
+        return read_type
     else:
         raise ResolveError(f"Cannot promote an binary to {read_type}")
 

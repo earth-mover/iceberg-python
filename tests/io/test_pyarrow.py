@@ -58,8 +58,14 @@ from pyiceberg.expressions import (
     BoundNotStartsWith,
     BoundReference,
     BoundStartsWith,
+    EqualTo,
     GreaterThan,
+    GreaterThanOrEqual,
+    In,
+    IsNull,
     Not,
+    NotEqualTo,
+    NotNull,
     Or,
 )
 from pyiceberg.expressions.literals import literal
@@ -115,6 +121,7 @@ from pyiceberg.types import (
     StructType,
     TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
     TimestamptzType,
     TimeType,
 )
@@ -1158,6 +1165,102 @@ def project(
             for file in files
         ]
     )
+
+
+WKB_POINT_1_2 = bytes.fromhex("0101000000000000000000f03f0000000000000040")
+WKB_POINT_3_4 = bytes.fromhex("010100000000000000000008400000000000001040")
+GEO_TABLE_SCHEMA = Schema(
+    NestedField(1, "id", IntegerType(), required=True),
+    NestedField(2, "geom", GeometryType("srid:3857"), required=False),
+    NestedField(3, "geog", GeographyType("srid:4326", "vincenty"), required=False),
+)
+
+
+def _geo_parquet_file(tmp_path: Path, geom: pa.Array, geog: pa.Array) -> str:
+    """Write a Parquet file with geo columns the way another engine would, with field ids but no Iceberg schema."""
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),
+            pa.field("geom", geom.type, nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "2"}),
+            pa.field("geog", geog.type, nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "3"}),
+        ]
+    )
+    table = pa.Table.from_arrays([pa.array([1, 2, 3], pa.int32()), geom, geog], schema=arrow_schema)
+    return _write_table_to_file(str(tmp_path / "geo.parquet"), arrow_schema, table)
+
+
+def _assert_geo_result(result: pa.Table, expected_types: tuple[pa.DataType, pa.DataType]) -> None:
+    assert result.column("id").to_pylist() == [1, 2, 3]
+    assert result.schema.field("geom").type == expected_types[0]
+    assert result.schema.field("geog").type == expected_types[1]
+    for name in ("geom", "geog"):
+        column = result.column(name)
+        storage = column.cast(column.type.storage_type) if isinstance(column.type, pa.ExtensionType) else column
+        assert storage.to_pylist() == [WKB_POINT_1_2, None, WKB_POINT_3_4]
+
+
+@pytest.mark.parametrize("binary_type", [pa.binary(), pa.large_binary()])
+def test_projection_geo_from_plain_binary(tmp_path: Path, binary_type: pa.DataType) -> None:
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], binary_type)
+    file = _geo_parquet_file(tmp_path, values, values)
+    result = project(GEO_TABLE_SCHEMA, [file])
+    _assert_geo_result(
+        result,
+        (schema_to_pyarrow(GeometryType("srid:3857")), schema_to_pyarrow(GeographyType("srid:4326", "vincenty"))),
+    )
+
+
+def test_projection_geo_from_plain_binary_without_geoarrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], pa.binary())
+    file = _geo_parquet_file(tmp_path, values, values)
+    # Importing a module set to None raises ImportError, as if geoarrow-pyarrow was not installed
+    monkeypatch.setitem(sys.modules, "geoarrow.pyarrow", None)
+    result = project(GEO_TABLE_SCHEMA, [file])
+    _assert_geo_result(result, (pa.large_binary(), pa.large_binary()))
+
+
+def test_projection_geo_from_geoarrow(tmp_path: Path) -> None:
+    ga = pytest.importorskip("geoarrow.pyarrow")
+    wkb = ga.as_wkb(pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], pa.binary()))
+    geom_type = ga.wkb().with_crs("srid:3857")
+    # The PyArrow Parquet writer only supports planar and spherical edges
+    geog_type = ga.wkb().with_crs("srid:4326").with_edge_type(ga.EdgeType.SPHERICAL)
+    geom = pa.ExtensionArray.from_storage(geom_type, wkb.storage)
+    geog = pa.ExtensionArray.from_storage(geog_type, wkb.storage)
+    file = _geo_parquet_file(tmp_path, geom, geog)
+    table_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "geom", GeometryType("srid:3857"), required=False),
+        NestedField(3, "geog", GeographyType("srid:4326"), required=False),
+    )
+    result = project(table_schema, [file])
+    _assert_geo_result(result, (geom_type, geog_type))
+
+
+@pytest.mark.parametrize(
+    "expr, expected_ids",
+    [
+        (EqualTo("geom", WKB_POINT_3_4), [3]),
+        (NotEqualTo("geog", WKB_POINT_3_4), [1]),
+        (In("geom", {WKB_POINT_1_2, WKB_POINT_3_4}), [1, 3]),
+        (IsNull("geom"), [2]),
+        (NotNull("geog"), [1, 3]),
+    ],
+)
+def test_projection_geo_equality_filter(tmp_path: Path, expr: BooleanExpression, expected_ids: list[int]) -> None:
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], pa.binary())
+    file = _geo_parquet_file(tmp_path, values, values)
+    assert project(GEO_TABLE_SCHEMA, [file], expr=expr).column("id").to_pylist() == expected_ids
+
+
+def test_projection_geo_filter_on_other_column(tmp_path: Path) -> None:
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], pa.binary())
+    file = _geo_parquet_file(tmp_path, values, values)
+    result = project(GEO_TABLE_SCHEMA, [file], expr=GreaterThan("id", 1))
+    assert result.column("id").to_pylist() == [2, 3]
+    geom = result.column("geom")
+    storage = geom.cast(geom.type.storage_type) if isinstance(geom.type, pa.ExtensionType) else geom
+    assert storage.to_pylist() == [None, WKB_POINT_3_4]
 
 
 def test_projection_add_column(file_int: str) -> None:
@@ -3390,6 +3493,39 @@ def test_task_to_record_batches_nanos(format_version: TableVersion, tmpdir: str)
         )
 
     assert _expected_batch("ns" if format_version > 2 else "us").equals(actual_result)
+
+
+@pytest.mark.parametrize(
+    "iceberg_type, tz",
+    [(TimestampNanoType(), None), (TimestamptzNanoType(), "UTC")],
+)
+def test_task_to_record_batches_micros_file_for_nanos_table(iceberg_type: PrimitiveType, tz: str | None, tmpdir: str) -> None:
+    # A file written with downcast-ns-timestamp-to-us-on-write stores microseconds for a nanosecond column
+    arrow_type = pa.timestamp("us", tz=tz)
+    arrow_table = pa.table(
+        [pa.array([1755172800000000, 1755176400000001], type=arrow_type)],
+        pa.schema((pa.field("ts_field", arrow_type, nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),)),
+    )
+    data_file = _write_table_to_data_file(f"{tmpdir}/test_micros_file_for_nanos_table.parquet", arrow_table.schema, arrow_table)
+    table_schema = Schema(NestedField(1, "ts_field", iceberg_type, required=False))
+    zone = "+00:00" if tz else ""
+
+    actual_result = list(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=GreaterThanOrEqual("ts_field", f"2025-08-14T13:00:00{zone}").bind(table_schema),
+            projected_schema=table_schema,
+            table_schema=table_schema,
+            projected_field_ids={1},
+            positional_deletes=None,
+            case_sensitive=True,
+            format_version=3,
+        )
+    )[0]
+
+    expected = pa.record_batch([pa.array([1755176400000001000], type=pa.timestamp("ns", tz=tz))], names=["ts_field"])
+    assert expected.equals(actual_result)
 
 
 def test_task_to_record_batches_scanner_filter_not_set_with_positional_deletes(tmpdir: str) -> None:

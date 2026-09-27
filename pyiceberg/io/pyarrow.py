@@ -30,6 +30,7 @@ import fnmatch
 import functools
 import importlib
 import itertools
+import json
 import logging
 import operator
 import os
@@ -155,6 +156,8 @@ from pyiceberg.table.puffin import PuffinFile
 from pyiceberg.transforms import IdentityTransform, TruncateTransform
 from pyiceberg.typedef import EMPTY_DICT, Properties, Record, TableVersion
 from pyiceberg.types import (
+    DEFAULT_GEOMETRY_CRS,
+    GEOGRAPHY_ALGORITHMS,
     BinaryType,
     BooleanType,
     DateType,
@@ -851,13 +854,54 @@ class _ConvertToArrowSchema(SchemaVisitorPerPrimitiveType[pa.DataType]):
             import geoarrow.pyarrow as ga
 
             wkb_type = ga.wkb().with_crs(geography_type.crs)
-            # Map Iceberg algorithm to GeoArrow edge type
-            if geography_type.algorithm == "spherical":
-                wkb_type = wkb_type.with_edge_type(ga.EdgeType.SPHERICAL)
+            # Map the Iceberg edge-interpolation algorithm to the GeoArrow edge type of the same name
+            if geography_type.algorithm in GEOGRAPHY_ALGORITHMS:
+                wkb_type = wkb_type.with_edge_type(ga.EdgeType[geography_type.algorithm.upper()])
             # "planar" is the default edge type in GeoArrow, no need to set explicitly
             return wkb_type
         except ImportError:
             return pa.large_binary()
+
+
+GEOARROW_WKB_EXTENSION_NAME = "geoarrow.wkb"
+
+
+def _geoarrow_crs_to_iceberg(crs: Any) -> str:
+    """Convert the CRS of a GeoArrow extension type to an Iceberg CRS string."""
+    if crs is None:
+        return DEFAULT_GEOMETRY_CRS
+    if isinstance(crs, str):
+        return crs
+    if isinstance(crs, dict) and isinstance(crs_id := crs.get("id"), dict) and "authority" in crs_id and "code" in crs_id:
+        # PROJJSON, e.g. {"id": {"authority": "EPSG", "code": 3857}}
+        return f"{crs_id['authority']}:{crs_id['code']}"
+    raise TypeError(f"Unsupported GeoArrow CRS, expected a string or PROJJSON with an id: {crs}")
+
+
+def _geoarrow_wkb_to_iceberg(extension_type: pa.ExtensionType) -> PrimitiveType:
+    """Convert a GeoArrow WKB extension type to an Iceberg geometry or geography type.
+
+    The extension metadata is JSON with an optional `crs` and `edges`; planar edges (the default) map to a
+    geometry, any other edge type to a geography with the algorithm of the same name.
+    """
+    serialized = extension_type.__arrow_ext_serialize__()
+    metadata = json.loads(serialized) if serialized else {}
+    crs = _geoarrow_crs_to_iceberg(metadata.get("crs"))
+    edges = metadata.get("edges")
+    if edges is None or edges == "planar":
+        return GeometryType(crs)
+    if edges in GEOGRAPHY_ALGORITHMS:
+        return GeographyType(crs, edges)
+    raise TypeError(f"Unsupported GeoArrow edge type: {edges}")
+
+
+def _cast_to_geo(values: pa.Array, target_type: pa.DataType) -> pa.Array:
+    """Cast WKB values (binary, large_binary or a WKB extension array) to the Arrow type of a geo field."""
+    if isinstance(values.type, pa.ExtensionType):
+        values = values.storage
+    if isinstance(target_type, pa.ExtensionType):
+        return pa.ExtensionArray.from_storage(target_type, values.cast(target_type.storage_type))
+    return values.cast(target_type)
 
 
 def _convert_scalar(value: Any, iceberg_type: IcebergType) -> pa.scalar:
@@ -1443,7 +1487,10 @@ class _ConvertToIceberg(PyArrowSchemaVisitor[IcebergType | Schema]):
         return MapType(key_id, key_result, value_id, value_result, value_required=not value_field.nullable)
 
     def primitive(self, primitive: pa.DataType) -> PrimitiveType:
-        if pa.types.is_boolean(primitive):
+        if isinstance(primitive, pa.ExtensionType) and primitive.extension_name == GEOARROW_WKB_EXTENSION_NAME:
+            # Only produced when geoarrow-pyarrow has registered the extension type
+            return _geoarrow_wkb_to_iceberg(primitive)
+        elif pa.types.is_boolean(primitive):
             return BooleanType()
         elif pa.types.is_integer(primitive):
             width = primitive.bit_width
@@ -1996,6 +2043,16 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
                         elif target_type.unit == "us" and values.type.unit in {"s", "ms", "us"}:
                             return values.cast(target_type)
                     raise ValueError(f"Unsupported schema projection from {values.type} to {target_type}")
+                elif isinstance(field.field_type, (TimestampNanoType, TimestamptzNanoType)):
+                    # Files written with downcast-ns-timestamp-to-us-on-write store microseconds for nanosecond columns.
+                    # The Arrow type carries the unit, so upcasting is exact. This is deliberately not a promote() rule,
+                    # which would also allow timestamp -> timestamp_ns schema evolution and misread Avro longs.
+                    if (
+                        pa.types.is_timestamp(values.type)
+                        and values.type.unit in {"s", "ms", "us"}
+                        and (values.type.tz in UTC_ALIASES if target_type.tz else values.type.tz is None)
+                    ):
+                        return values.cast(target_type)
                 elif isinstance(field.field_type, (IntegerType, LongType)):
                     # Cast smaller integer types to target type for cross-platform compatibility
                     # Only allow widening conversions (smaller bit width to larger)
@@ -2014,6 +2071,12 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
                         target_width = target_type.bit_width
                         if source_width < target_width:
                             return values.cast(target_type)
+                elif isinstance(field.field_type, (GeometryType, GeographyType)):
+                    # Parquet GEOMETRY/GEOGRAPHY columns are read as WKB binary; attach the geo type of the table
+                    # schema (a GeoArrow extension type when geoarrow-pyarrow is installed, else large_binary)
+                    storage_type = values.type.storage_type if isinstance(values.type, pa.ExtensionType) else values.type
+                    if pa.types.is_binary(storage_type) or pa.types.is_large_binary(storage_type):
+                        return _cast_to_geo(values, target_type)
 
             if field.field_type != file_field.field_type:
                 target_schema = schema_to_pyarrow(
@@ -2302,6 +2365,17 @@ class StatsAggregator:
             if self.trunc_length is not None:
                 raise ValueError(f"{self.primitive_type} cannot be truncated")
             return self.serialize(self.current_max)
+
+
+_PARQUET_TIME_UNIT_TO_NANOS = {"milliseconds": 1_000_000, "microseconds": 1_000, "nanoseconds": 1}
+
+
+def _parquet_timestamp_nanos_per_unit(statistics: pq.Statistics) -> int:
+    """Return the factor that converts raw Parquet timestamp statistics to nanoseconds."""
+    time_unit = json.loads(statistics.logical_type.to_json()).get("timeUnit", "nanoseconds")
+    if time_unit not in _PARQUET_TIME_UNIT_TO_NANOS:
+        raise ValueError(f"Unsupported Parquet timestamp unit: {time_unit}")
+    return _PARQUET_TIME_UNIT_TO_NANOS[time_unit]
 
 
 DEFAULT_TRUNCATION_LENGTH = 16
@@ -2620,6 +2694,13 @@ def data_file_statistics_from_parquet_metadata(
                             if statistics.max_raw is not None
                             else None
                         )
+                    elif isinstance(stats_col.iceberg_type, (TimestampNanoType, TimestamptzNanoType)):
+                        # statistics.min/max are datetimes truncated to microseconds, so use the raw int64 values
+                        nanos_per_unit = _parquet_timestamp_nanos_per_unit(statistics)
+                        if statistics.min_raw is not None:
+                            col_aggs[field_id].update_min(statistics.min_raw * nanos_per_unit)
+                        if statistics.max_raw is not None:
+                            col_aggs[field_id].update_max(statistics.max_raw * nanos_per_unit)
                     else:
                         col_aggs[field_id].update_min(statistics.min)
                         col_aggs[field_id].update_max(statistics.max)

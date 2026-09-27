@@ -21,7 +21,9 @@ features Spark SQL cannot produce). Each test asserts spec-correct behaviour; th
 document known gaps and must be un-marked when the gap is closed.
 """
 
+import json
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 
 import pyarrow as pa
@@ -29,6 +31,7 @@ import pytest
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.expressions import EqualTo, GreaterThanOrEqual, LessThan
+from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.schema import Schema
 from pyiceberg.transforms import BucketTransform, MonthTransform, YearTransform
 from pyiceberg.types import (
@@ -51,7 +54,7 @@ NS_PARTITIONS = [
 
 
 @pytest.fixture
-def probe_identifier(session_catalog: Catalog) -> str:
+def probe_identifier(session_catalog: Catalog) -> Iterator[str]:
     name = f"default.test_v3_probe_{uuid.uuid4().hex[:8]}"
     yield name
     try:
@@ -78,7 +81,6 @@ def test_v3_ns_timestamps_read(session_catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="No literal conversion to timestamp_ns / timestamptz_ns")
 @pytest.mark.parametrize(
     "row_filter, expected",
     [
@@ -101,7 +103,7 @@ def test_v3_ns_partition_transforms_match_java(session_catalog: Catalog) -> None
     arrow = table.scan().to_arrow().sort_by("id")
     ts = arrow.column("ts").cast(pa.int64()).to_pylist()
     tstz = arrow.column("tstz").cast(pa.int64()).to_pylist()
-    for (row_id, year, month, bucket), ts_value, tstz_value in zip(NS_PARTITIONS, ts, tstz):
+    for (row_id, year, month, bucket), ts_value, tstz_value in zip(NS_PARTITIONS, ts, tstz, strict=True):
         assert YearTransform().transform(schema.find_type("ts"))(ts_value) == year, row_id
         assert MonthTransform().transform(schema.find_type("tstz"))(tstz_value) == month, row_id
         assert BucketTransform(4).transform(schema.find_type("tstz"))(tstz_value) == bucket, row_id
@@ -111,7 +113,6 @@ def test_v3_ns_partition_transforms_match_java(session_catalog: Catalog) -> None
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="No literal conversion to timestamp_ns, so no partition pruning on ns columns")
 def test_v3_ns_partition_pruning(session_catalog: Catalog) -> None:
     table = session_catalog.load_table("default.test_v3_ns_partitions")
     scan = table.scan(row_filter=GreaterThanOrEqual("ts", "2024-01-01T00:00:00"))
@@ -123,7 +124,6 @@ def test_v3_ns_partition_pruning(session_catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="Java serializes geometry(srid:3857) unquoted; PyIceberg requires quotes")
 def test_v3_geo_schema_from_java(session_catalog: Catalog) -> None:
     table = session_catalog.load_table("default.test_v3_geo")
     schema = table.schema()
@@ -134,7 +134,6 @@ def test_v3_geo_schema_from_java(session_catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="PyIceberg sends quoted CRS strings that the Java REST server stores verbatim or rejects")
 def test_v3_geo_types_created_through_rest_match_java_serialization(session_catalog: Catalog, probe_identifier: str) -> None:
     schema = Schema(
         NestedField(1, "id", IntegerType(), required=True),
@@ -145,6 +144,30 @@ def test_v3_geo_types_created_through_rest_match_java_serialization(session_cata
     loaded = session_catalog.load_table(probe_identifier)
     assert loaded.schema().find_type("geom_srid") == GeometryType("srid:3857")
     assert loaded.schema().find_type("geog_v") == GeographyType("srid:4326", "vincenty")
+
+
+@pytest.mark.integration
+def test_v3_geo_metadata_written_by_java_server_uses_spec_type_strings(session_catalog: Catalog, probe_identifier: str) -> None:
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "geom", GeometryType(), required=False),
+        NestedField(3, "geom_srid", GeometryType("srid:3857"), required=False),
+        NestedField(4, "geog_v", GeographyType("srid:4326", "vincenty"), required=False),
+    )
+    table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "3"})
+    io = PyArrowFileIO(
+        properties={"s3.endpoint": "http://localhost:9000", "s3.access-key-id": "admin", "s3.secret-access-key": "password"}
+    )
+    with io.new_input(table.metadata_location).open() as f:
+        metadata = json.loads(f.read())
+    # The metadata file is written by the Java REST server, so it shows how Java understood the type strings
+    types = {field["name"]: field["type"] for field in metadata["schemas"][-1]["fields"]}
+    assert types == {
+        "id": "int",
+        "geom": "geometry",
+        "geom_srid": "geometry(srid:3857)",
+        "geog_v": "geography(srid:4326, vincenty)",
+    }
 
 
 # ---------------------------------------------------------------------------- default values
@@ -158,7 +181,7 @@ def test_v3_initial_defaults_applied_on_read(session_catalog: Catalog, spark: "S
     rows = table.scan().to_arrow().sort_by("id").to_pylist()
     spark_rows = spark.sql("SELECT * FROM rest.default.test_v3_defaults ORDER BY id").collect()
     assert len(rows) == len(spark_rows) == 2
-    for row, spark_row in zip(rows, spark_rows):
+    for row, spark_row in zip(rows, spark_rows, strict=True):
         assert row["color"] == spark_row["color"] == "blue"
         assert row["qty"] == spark_row["qty"] == 42
         assert row["ratio"] == spark_row["ratio"] == 1.5
