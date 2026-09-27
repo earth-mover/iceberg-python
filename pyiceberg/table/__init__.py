@@ -40,15 +40,25 @@ from pyiceberg.expressions.visitors import (
     _InclusiveMetricsEvaluator,
     bind,
     expression_evaluator,
+    extract_field_ids,
     inclusive_projection,
     manifest_evaluator,
 )
 from pyiceberg.io import FileIO, load_file_io
-from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestEntry, ManifestEntryStatus, ManifestFile
+from pyiceberg.manifest import (
+    DataFile,
+    DataFileContent,
+    FileFormat,
+    ManifestContent,
+    ManifestEntry,
+    ManifestEntryStatus,
+    ManifestFile,
+)
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, UNPARTITIONED_PARTITION_SPEC, PartitionKey, PartitionSpec
-from pyiceberg.schema import Schema
+from pyiceberg.schema import Schema, prune_columns
 from pyiceberg.table.delete_file import DeleteFileSet
 from pyiceberg.table.delete_file_index import DeleteFileIndex
+from pyiceberg.table.deletion_vector import DeletionVector
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
@@ -113,6 +123,7 @@ if TYPE_CHECKING:
     import pandas as pd
     import polars as pl
     import pyarrow as pa
+    import pyarrow.compute as pc
     import ray
     from duckdb import DuckDBPyConnection
     from pyiceberg_core.datafusion import IcebergDataFusionTable
@@ -755,6 +766,8 @@ class Transaction:
 
             - DELETE: In case existing Parquet files can be dropped completely.
             - OVERWRITE: In case existing Parquet files need to be rewritten to drop rows that match the delete filter.
+            - DELETE: In case of a format version 3 table with `write.delete.mode=merge-on-read`, rows in
+              partially matching files are marked as deleted with deletion vectors instead of rewriting the files.
 
         Args:
             delete_filter: A boolean expression to delete rows from a table
@@ -764,11 +777,19 @@ class Transaction:
         """
         from pyiceberg.io.pyarrow import ArrowScan, _dataframe_to_data_files, _expression_to_complementary_pyarrow
 
+        use_deletion_vectors = False
         if (
             self.table_metadata.properties.get(TableProperties.DELETE_MODE, TableProperties.DELETE_MODE_DEFAULT)
             == TableProperties.DELETE_MODE_MERGE_ON_READ
         ):
-            warnings.warn("Merge on read is not yet supported, falling back to copy-on-write", stacklevel=2)
+            if self.table_metadata.format_version < 3:
+                warnings.warn(
+                    "Merge-on-read deletes require format version 3 (deletion vectors); falling back to copy-on-write",
+                    stacklevel=2,
+                )
+            else:
+                # The delete phase of an overwrite (which passes an isolation operation) keeps copy-on-write
+                use_deletion_vectors = _isolation_operation is None
 
         if isinstance(delete_filter, str):
             delete_filter = _parse_row_filter(delete_filter)
@@ -779,7 +800,15 @@ class Transaction:
             delete_snapshot.delete_by_predicate(delete_filter, case_sensitive)
 
         # Check if there are any files that require an actual rewrite of a data file
-        if delete_snapshot.rewrites_needed is True:
+        if delete_snapshot.rewrites_needed is True and use_deletion_vectors:
+            self._delete_with_deletion_vectors(
+                delete_filter=delete_filter,
+                case_sensitive=case_sensitive,
+                snapshot_properties=snapshot_properties,
+                branch=branch,
+                starting_snapshot_id=delete_snapshot._starting_snapshot_id,
+            )
+        elif delete_snapshot.rewrites_needed is True:
             bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
             preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, self.table_metadata.schema())
 
@@ -843,6 +872,66 @@ class Transaction:
 
         if not delete_snapshot.files_affected and not delete_snapshot.rewrites_needed:
             warnings.warn("Delete operation did not match any records", stacklevel=2)
+
+    def _delete_with_deletion_vectors(
+        self,
+        delete_filter: BooleanExpression,
+        case_sensitive: bool,
+        snapshot_properties: dict[str, str],
+        branch: str | None,
+        starting_snapshot_id: int | None,
+    ) -> None:
+        """Mark the rows matching the filter as deleted with deletion vectors (merge-on-read).
+
+        Each partially matching data file gets one deletion vector holding the matching positions
+        and the positions deleted before, replacing the file's previous deletion vector and
+        file-scoped position delete files.
+        """
+        from pyiceberg.io.pyarrow import _expression_to_complementary_pyarrow
+        from pyiceberg.table.deletion_vector import write_deletion_vectors
+
+        schema = self.table_metadata.schema()
+        bound_delete_filter = bind(schema, delete_filter, case_sensitive)
+        preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, schema)
+        filter_field_ids = extract_field_ids(bound_delete_filter)
+
+        file_scan = self._scan(row_filter=delete_filter, case_sensitive=case_sensitive)
+        if branch is not None:
+            file_scan = file_scan.use_ref(branch)
+
+        def _plan(task: FileScanTask) -> tuple[DataFile, DeletionVector, list[DataFile]] | None:
+            positions = _deleted_positions(self.table_metadata, self._table.io, task, filter_field_ids, preserve_row_filter)
+            if len(positions) == 0:
+                return None
+            deletion_vector = DeletionVector.from_positions(task.file.file_path, positions)
+            previous, replaced = _previous_deletes(self._table.io, task)
+            if previous is not None:
+                merged = previous.union(deletion_vector)
+                if merged.cardinality == previous.cardinality:
+                    # All matching rows were deleted before
+                    return None
+                deletion_vector = merged
+            return task.file, deletion_vector, replaced
+
+        executor = ExecutorFactory.get_or_create()
+        planned = [result for result in executor.map(_plan, file_scan.plan_files()) if result is not None]
+        if not planned:
+            return
+
+        commit_uuid = uuid.uuid4()
+        location = self._table.location_provider().new_data_location(f"00000-0-{commit_uuid}-00001-deletes.puffin")
+        with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).row_delta(commit_uuid) as row_delta:
+            row_delta._starting_snapshot_id = starting_snapshot_id
+            row_delta.delete_by_predicate(delete_filter, case_sensitive)
+            # Track the location before writing, so a partially written file is removed on failure
+            row_delta._written_delete_file_paths.add(location)
+            delete_files = write_deletion_vectors(self._table.io, location, [(data_file, dv) for data_file, dv, _ in planned])
+            for delete_file in delete_files:
+                row_delta._add_written_delete_file(delete_file)
+            for _, _, replaced in planned:
+                for replaced_delete_file in replaced:
+                    row_delta.remove_delete_file(replaced_delete_file)
+            row_delta.validate_data_files_exist({data_file for data_file, _, _ in planned})
 
     def upsert(
         self,
@@ -1286,6 +1375,66 @@ class CreateTableTransaction(Transaction):
         self._requirements = ()
 
         return self._table
+
+
+def _deleted_positions(
+    table_metadata: TableMetadata,
+    io: FileIO,
+    task: FileScanTask,
+    filter_field_ids: set[int],
+    preserve_row_filter: pc.Expression,
+) -> list[int]:
+    """Return the positions of the rows in the task's data file that the preserve filter does not keep.
+
+    The rows are read without applying existing deletes, so the positions are relative to the file.
+    """
+    import pyarrow.compute as pc
+
+    from pyiceberg.io.pyarrow import _ROW_POSITION_COLUMN, ArrowScan, _row_positions
+
+    projected_schema = prune_columns(table_metadata.schema(), filter_field_ids, select_full_types=False)
+    df = ArrowScan(table_metadata=table_metadata, io=io, projected_schema=projected_schema, row_filter=AlwaysTrue()).to_table(
+        tasks=[FileScanTask(task.file, sequence_number=task.sequence_number)]
+    )
+    if df.num_rows != task.file.record_count:
+        raise ValueError(f"Expected {task.file.record_count} rows in {task.file.file_path}, but read {df.num_rows}")
+
+    positions = _row_positions(0, df.num_rows)
+    kept = df.append_column(_ROW_POSITION_COLUMN, positions).filter(preserve_row_filter).column(_ROW_POSITION_COLUMN)
+    return pc.filter(positions, pc.invert(pc.is_in(positions, value_set=kept))).to_pylist()
+
+
+def _previous_deletes(io: FileIO, task: FileScanTask) -> tuple[DeletionVector | None, list[DataFile]]:
+    """Return the positions deleted by the task's position deletes, and the delete files a new deletion vector replaces.
+
+    A new deletion vector replaces the data file's previous deletion vector and its file-scoped position delete
+    files, as in Java. Partition-scoped position delete files are kept; their positions are merged in.
+    """
+    from pyiceberg.io.pyarrow import _read_deletes
+    from pyiceberg.table.delete_file_index import _referenced_data_file_path
+    from pyiceberg.table.deletion_vector import read_deletion_vectors
+
+    data_file_path = task.file.file_path
+    previous: DeletionVector | None = None
+    replaced: list[DataFile] = []
+    for delete_file in task.delete_files:
+        if delete_file.content != DataFileContent.POSITION_DELETES:
+            continue
+        if delete_file.file_format == FileFormat.PUFFIN:
+            vectors = [dv for dv in read_deletion_vectors(io, delete_file) if dv.referenced_data_file == data_file_path]
+            replaced.append(delete_file)
+        else:
+            positions = _read_deletes(io, delete_file).get(data_file_path)
+            vectors = (
+                [DeletionVector.from_positions(data_file_path, positions.to_pylist())]
+                if positions is not None and len(positions) > 0
+                else []
+            )
+            if data_file_path in (delete_file.referenced_data_file, _referenced_data_file_path(delete_file)):
+                replaced.append(delete_file)
+        for vector in vectors:
+            previous = vector if previous is None else previous.union(vector)
+    return previous, replaced
 
 
 class Namespace(IcebergRootModel[list[str]]):

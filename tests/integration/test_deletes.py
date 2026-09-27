@@ -197,7 +197,7 @@ def test_partitioned_table_no_match(spark: SparkSession, session_catalog: RestCa
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_delete_partitioned_table_positional_deletes(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.table_partitioned_delete"
 
@@ -244,7 +244,7 @@ def test_delete_partitioned_table_positional_deletes(spark: SparkSession, sessio
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_delete_partitioned_table_positional_deletes_empty_batch(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.test_delete_partitioned_table_positional_deletes_empty_batch"
 
@@ -312,7 +312,7 @@ def test_delete_partitioned_table_positional_deletes_empty_batch(spark: SparkSes
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_read_multiple_batches_in_task_with_position_deletes(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.test_read_multiple_batches_in_task_with_position_deletes"
 
@@ -365,7 +365,7 @@ def test_read_multiple_batches_in_task_with_position_deletes(spark: SparkSession
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_overwrite_partitioned_table(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.table_partitioned_delete"
 
@@ -415,7 +415,7 @@ def test_overwrite_partitioned_table(spark: SparkSession, session_catalog: RestC
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_partitioned_table_positional_deletes_sequence_number(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.table_partitioned_delete_sequence_number"
 

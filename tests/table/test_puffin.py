@@ -21,18 +21,21 @@ from os import path
 from pathlib import Path
 
 import pyarrow as pa
+import pytest
 from pyroaring import BitMap
 
+from pyiceberg import __version__
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
 from pyiceberg.table.deletion_vector import (
     _DV_BLOB_MAGIC_NUMBER,
     DELETION_VECTOR_V1_BLOB_TYPE,
     PROPERTY_REFERENCED_DATA_FILE,
+    DeletionVector,
     deletion_vectors_from_puffin_file,
     read_deletion_vectors,
 )
-from pyiceberg.table.puffin import MAGIC_BYTES, PuffinFile
+from pyiceberg.table.puffin import MAGIC_BYTES, PuffinFile, PuffinWriter
 
 
 def _open_file(file: str) -> bytes:
@@ -184,3 +187,115 @@ def test_deletion_vectors_from_puffin_file_skips_other_blob_types() -> None:
     deletion_vectors = deletion_vectors_from_puffin_file(PuffinFile(puffin_bytes))
 
     assert [dv.referenced_data_file for dv in deletion_vectors] == ["s3://bucket/b.parquet"]
+
+
+def _write(tmp_path: Path, *deletion_vectors: DeletionVector, created_by: str | None = None) -> Path:
+    puffin_path = tmp_path / "test.puffin"
+    with PuffinWriter(PyArrowFileIO().new_output(str(puffin_path)), created_by=created_by) as writer:
+        for dv in deletion_vectors:
+            writer.add_blob(dv.to_blob())
+    return puffin_path
+
+
+def test_puffin_writer_round_trips_single_blob(tmp_path: Path) -> None:
+    positions = [0, 1, 5, (1 << 32) + 7]
+    puffin_path = _write(tmp_path, DeletionVector.from_positions("file.parquet", positions))
+
+    dvs = deletion_vectors_from_puffin_file(PuffinFile(puffin_path.read_bytes()))
+
+    assert len(dvs) == 1
+    assert dvs[0].referenced_data_file == "file.parquet"
+    assert dvs[0].to_vector().to_pylist() == positions
+
+
+def test_puffin_writer_round_trips_multiple_blobs(tmp_path: Path) -> None:
+    puffin_path = _write(
+        tmp_path,
+        DeletionVector.from_positions("file1.parquet", [1, 2, 3]),
+        DeletionVector.from_positions("file2.parquet", [4, 5, 6]),
+    )
+
+    dvs = deletion_vectors_from_puffin_file(PuffinFile(puffin_path.read_bytes()))
+
+    assert {dv.referenced_data_file: dv.to_vector().to_pylist() for dv in dvs} == {
+        "file1.parquet": [1, 2, 3],
+        "file2.parquet": [4, 5, 6],
+    }
+
+
+def test_puffin_writer_layout(tmp_path: Path) -> None:
+    puffin_path = tmp_path / "test.puffin"
+    first = DeletionVector.from_positions("file1.parquet", [1, 2, 3]).to_blob()
+    second = DeletionVector.from_positions("file2.parquet", [4]).to_blob()
+    with PuffinWriter(PyArrowFileIO().new_output(str(puffin_path))) as writer:
+        first_metadata = writer.add_blob(first)
+        second_metadata = writer.add_blob(second)
+    puffin_bytes = puffin_path.read_bytes()
+
+    # The offsets and lengths are assigned when a blob is added
+    assert (first_metadata.offset, first_metadata.length) == (4, len(first.payload))
+    assert (second_metadata.offset, second_metadata.length) == (4 + len(first.payload), len(second.payload))
+    assert puffin_bytes[first_metadata.offset : first_metadata.offset + first_metadata.length] == first.payload
+    assert puffin_bytes[second_metadata.offset : second_metadata.offset + second_metadata.length] == second.payload
+
+    # Magic | blobs | magic | footer payload | footer payload size | flags | magic
+    footer_start = second_metadata.offset + second_metadata.length
+    footer_size = int.from_bytes(puffin_bytes[-12:-8], "little")
+    assert puffin_bytes[:4] == MAGIC_BYTES
+    assert puffin_bytes[footer_start : footer_start + 4] == MAGIC_BYTES
+    assert len(puffin_bytes) == footer_start + 4 + footer_size + 12
+    assert puffin_bytes[-8:-4] == b"\x00\x00\x00\x00"
+    assert puffin_bytes[-4:] == MAGIC_BYTES
+    assert writer.file_size == len(puffin_bytes)
+
+    footer = json.loads(puffin_bytes[footer_start + 4 : footer_start + 4 + footer_size])
+    assert footer["blobs"][0] == {
+        "type": "deletion-vector-v1",
+        "fields": [2147483645],
+        "snapshot-id": -1,
+        "sequence-number": -1,
+        "offset": 4,
+        "length": len(first.payload),
+        "properties": {"referenced-data-file": "file1.parquet", "cardinality": "3"},
+    }
+    assert PuffinFile(puffin_bytes).footer.blobs == [first_metadata, second_metadata]
+
+
+def test_puffin_writer_created_by(tmp_path: Path) -> None:
+    default = PuffinFile(_write(tmp_path, DeletionVector.from_positions("file.parquet", [1])).read_bytes())
+    assert default.footer.properties == {"created-by": f"PyIceberg version {__version__}"}
+
+    custom = PuffinFile(_write(tmp_path, created_by="my-test-app").read_bytes())
+    assert custom.footer.properties == {"created-by": "my-test-app"}
+
+
+def test_puffin_writer_empty(tmp_path: Path) -> None:
+    reader = PuffinFile(_write(tmp_path).read_bytes())
+
+    assert reader.footer.blobs == []
+    assert deletion_vectors_from_puffin_file(reader) == []
+
+
+def test_puffin_writer_does_not_write_on_exception(tmp_path: Path) -> None:
+    output_file = PyArrowFileIO().new_output(str(tmp_path / "test.puffin"))
+
+    def _fail() -> None:
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        with PuffinWriter(output_file) as writer:
+            writer.add_blob(DeletionVector.from_positions("file.parquet", [1]).to_blob())
+            _fail()
+
+    assert writer.closed
+    assert not output_file.exists()
+
+
+def test_puffin_writer_rejects_use_after_close(tmp_path: Path) -> None:
+    writer = PuffinWriter(PyArrowFileIO().new_output(str(tmp_path / "test.puffin")))
+    writer.close()
+
+    with pytest.raises(RuntimeError, match="Cannot add blob to closed Puffin writer"):
+        writer.add_blob(DeletionVector.from_positions("file.parquet", [2]).to_blob())
+    with pytest.raises(RuntimeError, match="Puffin writer is already closed"):
+        writer.close()

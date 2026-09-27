@@ -35,6 +35,10 @@ from pyiceberg.catalog import Catalog
 from pyiceberg.expressions import EqualTo, GreaterThanOrEqual, LessThan
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.schema import Schema
+from pyiceberg.table import Table
+from pyiceberg.table.deletion_vector import DeletionVector
+from pyiceberg.table.puffin import PuffinFile
+from pyiceberg.table.snapshots import Operation
 from pyiceberg.transforms import BucketTransform, MonthTransform, YearTransform
 from pyiceberg.types import (
     GeographyType,
@@ -576,3 +580,151 @@ def test_v3_pyiceberg_unknown_column_append_read_by_spark(
         assert pq.ParquetFile(f).schema_arrow.names == ["id"]
     rows = spark.sql(f"SELECT id, unk FROM rest.{probe_identifier} ORDER BY id").collect()
     assert [(r["id"], r["unk"]) for r in rows] == [(1, None), (2, None)]
+
+
+# ---------------------------------------------------------------------------- deletion vector writes
+
+_DELETE_FILE_COLUMNS = ["content", "file_path", "file_format", "record_count", "referenced_data_file", "content_offset"]
+
+
+def _spark_delete_files(spark: "SparkSession", identifier: str) -> list[dict[str, object]]:  # type: ignore[name-defined] # noqa: F821
+    rows = spark.sql(f"SELECT * FROM rest.{identifier}.delete_files").collect()
+    return sorted(({column: row[column] for column in _DELETE_FILE_COLUMNS + ["content_size_in_bytes"]} for row in rows), key=str)
+
+
+def _pyiceberg_delete_files(table: Table) -> list[dict[str, object]]:
+    rows = table.inspect.delete_files().to_pylist()
+    return sorted(({column: row[column] for column in _DELETE_FILE_COLUMNS + ["content_size_in_bytes"]} for row in rows), key=str)
+
+
+@pytest.mark.integration
+def test_v3_pyiceberg_merge_on_read_deletes_read_by_spark(
+    session_catalog: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+    probe_identifier: str,
+) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    table = session_catalog.create_table(
+        probe_identifier, schema, properties={"format-version": "3", "write.delete.mode": "merge-on-read"}
+    )
+    table.append(_ids([1, 2, 3, 4, 5]))
+    data_file = next(iter(table.scan().plan_files())).file
+    row_ids_before = {r["id"]: r["_row_id"] for r in table.scan(selected_fields=("id", "_row_id")).to_arrow().to_pylist()}
+
+    table.delete(EqualTo("id", 2))
+
+    table = session_catalog.load_table(probe_identifier)
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    assert snapshot.summary.operation == Operation.DELETE
+    assert snapshot.summary["added-dvs"] == "1"
+    assert snapshot.summary["added-position-deletes"] == "1"
+    (dv,) = table.inspect.delete_files().to_pylist()
+    assert dv["file_format"] == "PUFFIN"
+    assert dv["referenced_data_file"] == data_file.file_path
+    assert dv["content_offset"] == 4
+    assert dv["content_size_in_bytes"] > 0
+    assert dv["record_count"] == 1
+    assert _spark_delete_files(spark, probe_identifier) == _pyiceberg_delete_files(table)
+
+    spark_rows = spark.sql(f"SELECT id, _row_id FROM rest.{probe_identifier} ORDER BY id").collect()
+    assert [r["id"] for r in spark_rows] == [1, 3, 4, 5]
+    # The data file is not rewritten, so the surviving rows keep their row ids
+    assert {r["id"]: r["_row_id"] for r in spark_rows} == {i: row_ids_before[i] for i in [1, 3, 4, 5]}
+    row_ids_after = {r["id"]: r["_row_id"] for r in table.scan(selected_fields=("id", "_row_id")).to_arrow().to_pylist()}
+    assert row_ids_after == {i: row_ids_before[i] for i in [1, 3, 4, 5]}
+    assert table.scan().count() == spark.sql(f"SELECT COUNT(*) AS n FROM rest.{probe_identifier}").collect()[0]["n"] == 4
+
+    # A second delete on the same data file replaces its DV with the union of the deleted positions
+    table.delete("id in (4, 5)")
+
+    table = session_catalog.load_table(probe_identifier)
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    assert snapshot.summary["added-dvs"] == "1"
+    assert snapshot.summary["removed-dvs"] == "1"
+    assert snapshot.summary["removed-delete-files"] == "1"
+    assert snapshot.summary["total-delete-files"] == "1"
+    assert snapshot.summary["total-position-deletes"] == "3"
+    (replacement,) = table.inspect.delete_files().to_pylist()
+    assert replacement["file_path"] != dv["file_path"]
+    assert replacement["referenced_data_file"] == data_file.file_path
+    assert replacement["record_count"] == 3
+    assert _spark_delete_files(spark, probe_identifier) == _pyiceberg_delete_files(table)
+    assert [r["id"] for r in spark.sql(f"SELECT id FROM rest.{probe_identifier} ORDER BY id").collect()] == [1, 3]
+    assert table.scan().count() == spark.sql(f"SELECT COUNT(*) AS n FROM rest.{probe_identifier}").collect()[0]["n"] == 2
+
+
+@pytest.mark.integration
+def test_v3_pyiceberg_delete_merges_spark_deletion_vector(
+    session_catalog: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+    probe_identifier: str,
+) -> None:
+    spark.sql(
+        f"""
+        CREATE TABLE rest.{probe_identifier} (id BIGINT)
+        USING iceberg
+        TBLPROPERTIES ('format-version' = '3', 'write.delete.mode' = 'merge-on-read')
+        """
+    )
+    spark.range(1, 21).coalesce(1).writeTo(f"rest.{probe_identifier}").append()
+    spark.sql(f"DELETE FROM rest.{probe_identifier} WHERE id IN (3, 4)")
+
+    table = session_catalog.load_table(probe_identifier)
+    (spark_dv,) = table.inspect.delete_files().to_pylist()
+    table.delete("id = 10 or id = 11")
+
+    table = session_catalog.load_table(probe_identifier)
+    (dv,) = table.inspect.delete_files().to_pylist()
+    assert dv["file_path"] != spark_dv["file_path"]
+    assert dv["referenced_data_file"] == spark_dv["referenced_data_file"]
+    assert dv["record_count"] == 4
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    assert snapshot.summary["removed-dvs"] == "1"
+    assert snapshot.summary["total-position-deletes"] == "4"
+
+    expected = [i for i in range(1, 21) if i not in (3, 4, 10, 11)]
+    assert [r["id"] for r in spark.sql(f"SELECT id FROM rest.{probe_identifier} ORDER BY id").collect()] == expected
+    assert sorted(table.scan().to_arrow()["id"].to_pylist()) == expected
+    assert _spark_delete_files(spark, probe_identifier) == _pyiceberg_delete_files(table)
+
+    # Spark keeps deleting on top of the PyIceberg DV
+    spark.sql(f"DELETE FROM rest.{probe_identifier} WHERE id = 20")
+    table = session_catalog.load_table(probe_identifier)
+    (dv,) = table.inspect.delete_files().to_pylist()
+    assert dv["record_count"] == 5
+    assert sorted(table.scan().to_arrow()["id"].to_pylist()) == expected[:-1]
+    assert table.scan().count() == spark.sql(f"SELECT COUNT(*) AS n FROM rest.{probe_identifier}").collect()[0]["n"] == 15
+
+
+@pytest.mark.integration
+def test_v3_deletion_vector_blob_matches_spark(
+    session_catalog: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+    probe_identifier: str,
+) -> None:
+    spark.sql(
+        f"""
+        CREATE TABLE rest.{probe_identifier} (id BIGINT)
+        USING iceberg
+        TBLPROPERTIES ('format-version' = '3', 'write.delete.mode' = 'merge-on-read')
+        """
+    )
+    spark.range(0, 100).coalesce(1).writeTo(f"rest.{probe_identifier}").append()
+    # A contiguous run and scattered positions, so the Java side run-length encodes part of the bitmap
+    spark.sql(f"DELETE FROM rest.{probe_identifier} WHERE id BETWEEN 10 AND 60 OR id IN (3, 70, 99)")
+
+    table = session_catalog.load_table(probe_identifier)
+    (delete_file,) = [task_delete for task in table.scan().plan_files() for task_delete in task.delete_files]
+    with table.io.new_input(delete_file.file_path).open() as f:
+        puffin = PuffinFile(f.read())
+    (blob,) = puffin.footer.blobs
+
+    positions = [3, 70, 99, *range(10, 61)]
+    expected = DeletionVector.from_positions(blob.properties["referenced-data-file"], positions).to_blob()
+    assert puffin.get_blob_payload(blob) == expected.payload
+    assert blob.type == expected.metadata.type
+    assert blob.fields == expected.metadata.fields
+    assert blob.properties == expected.metadata.properties

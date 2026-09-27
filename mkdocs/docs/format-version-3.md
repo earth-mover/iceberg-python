@@ -36,8 +36,8 @@ The `files`, `data_files`, `delete_files`, `entries` and `all_*` inspect tables 
 | Upgrade a table from v1 or v2 to v3 | n/a | Yes | `upgrade_table_version(3)` sets `next-row-id` to 0 and leaves existing snapshots untouched. |
 | Manifests and manifest lists | Yes | Yes | Data and delete manifests; manifest lists assign `first-row-id` to data manifests. |
 | Row lineage (`_row_id`, `_last_updated_sequence_number`) | Yes | Yes | Data files inherit `first_row_id` from their manifest, and both columns can be requested in `selected_fields` (see [Row lineage metadata columns](api.md#row-lineage-metadata-columns)). Commits set the snapshot `first-row-id` and `added-rows` and advance `next-row-id`. |
-| Deletion vectors (Puffin) | Yes | No | Only the blob range named by `content_offset` / `content_size_in_bytes` is read, and the blob length, magic, CRC-32 and cardinality are validated. A DV applies only to its `referenced_data_file` and replaces older position deletes for that file. Deletes on v3 tables are copy-on-write. |
-| Position delete files (v2 style) | Yes | No | |
+| Deletion vectors (Puffin) | Yes | Yes | Only the blob range named by `content_offset` / `content_size_in_bytes` is read, and the blob length, magic, CRC-32 and cardinality are validated. A DV applies only to its `referenced_data_file` and replaces older position deletes for that file. `delete()` writes DVs when `write.delete.mode` is `merge-on-read` (see [Merge-on-read deletes](#merge-on-read-deletes)); `overwrite()` and `upsert()` are copy-on-write. |
+| Position delete files (v2 style) | Yes | No | v3 does not allow new position delete files; deletion vectors replace them. |
 | Equality deletes | Yes | No | Equality delete files apply to data files with a lower data sequence number in the same partition, or in every partition when written with an unpartitioned spec. A null delete value matches a null data value. `count()` honours them. |
 | `timestamp_ns` / `timestamptz_ns` | Yes | No | Values are read with nanosecond precision. Row filters and partition pruning work on nanosecond columns. |
 | `unknown` | Yes | Yes | Reads as null. Unknown columns must be optional with a null default and are not stored in data files. |
@@ -91,3 +91,26 @@ table.scan(row_filter=GreaterThanOrEqual("tstz_ns", "2024-01-01T00:00:00.1234567
 ```
 
 As with microsecond timestamps, `timestamptz_ns` filters require a zone offset and `timestamp_ns` filters reject one.
+
+## Merge-on-read deletes
+
+With the `write.delete.mode` table property set to `merge-on-read`, `delete()` on a v3 table marks the matching rows
+of a data file as deleted in a deletion vector instead of rewriting the file:
+
+```python
+table = catalog.create_table(
+    identifier="default.events",
+    schema=schema,
+    properties={"format-version": "3", "write.delete.mode": "merge-on-read"},
+)
+table.delete("id == 2")
+```
+
+- Data files whose rows all match the filter are still dropped as a whole.
+- All deletion vectors of a commit are written to one Puffin file, one `deletion-vector-v1` blob per data file.
+- A data file has at most one deletion vector. Deleting more rows from a file that already has one writes a new vector
+  with the union of the deleted positions and removes the old one in the same commit (`removed-dvs` in the snapshot
+  summary). Older file-scoped position delete files are merged in and removed as well.
+- The snapshot operation is `delete` and no rows are added, so row ids of the remaining rows are unchanged.
+- The commit is validated against concurrent commits: it fails with a `ValidationException` if another writer
+  removed one of the data files or added deletes for it.

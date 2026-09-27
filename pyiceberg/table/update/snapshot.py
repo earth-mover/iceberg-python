@@ -48,6 +48,7 @@ from pyiceberg.io import FileIO, OutputFile
 from pyiceberg.manifest import (
     DataFile,
     DataFileContent,
+    FileFormat,
     ManifestContent,
     ManifestEntry,
     ManifestEntryStatus,
@@ -59,6 +60,7 @@ from pyiceberg.manifest import (
 )
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.table.delete_file import DeleteFileSet
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     Operation,
@@ -316,6 +318,8 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
                     schema=schema,
                 )
 
+        self._update_summary(ssc)
+
         previous_snapshot = (
             table_metadata.snapshot_by_id(self._parent_snapshot_id) if self._parent_snapshot_id is not None else None
         )
@@ -324,6 +328,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             summary=Summary(operation=self._operation, **ssc.build(), **snapshot_properties),
             previous_summary=previous_snapshot.summary if previous_snapshot is not None else None,
         )
+
+    def _update_summary(self, collector: SnapshotSummaryCollector) -> None:
+        """Record additional file changes of this operation in the snapshot summary."""
 
     def _commit(self) -> UpdatesAndRequirements:
         new_manifests = self._manifests()
@@ -409,7 +416,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     def spec(self, spec_id: int) -> PartitionSpec:
         return self._transaction.table_metadata.specs()[spec_id]
 
-    def new_manifest_writer(self, spec: PartitionSpec) -> ManifestWriter:
+    def new_manifest_writer(self, spec: PartitionSpec, content: ManifestContent = ManifestContent.DATA) -> ManifestWriter:
         return write_manifest(
             format_version=self._transaction.table_metadata.format_version,
             spec=spec,
@@ -417,6 +424,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             output_file=self.new_manifest_output(),
             snapshot_id=self._snapshot_id,
             avro_compression=self._compression,
+            content=content,
         )
 
     def new_manifest_output(self) -> OutputFile:
@@ -907,6 +915,171 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
             raise ValidationException(f"Missing required files to delete: {', '.join(sorted(missing))}")
 
 
+class _RowDelta(_SnapshotProducer["_RowDelta"]):
+    """Adds delete files (deletion vectors) and removes the delete files they replace.
+
+    Produces a DELETE snapshot when only delete files are added, and an OVERWRITE snapshot when
+    data files change as well. Existing data and delete manifests are carried forward; delete
+    manifests holding a replaced delete file are rewritten with that entry marked as DELETED.
+    """
+
+    _added_delete_files: list[DataFile]
+    _removed_delete_files: DeleteFileSet
+    _referenced_data_files: set[DataFile]
+    _written_delete_file_paths: set[str]
+
+    def __init__(
+        self,
+        operation: Operation,
+        transaction: Transaction,
+        io: FileIO,
+        commit_uuid: uuid.UUID | None = None,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+        branch: str | None = MAIN_BRANCH,
+    ) -> None:
+        super().__init__(operation, transaction, io, commit_uuid, snapshot_properties, branch)
+        self._added_delete_files = []
+        self._removed_delete_files = DeleteFileSet()
+        self._referenced_data_files = set()
+        self._written_delete_file_paths = set()
+
+    def add_delete_file(self, delete_file: DataFile) -> _RowDelta:
+        """Add a delete file to the table."""
+        if delete_file.content == DataFileContent.DATA:
+            raise ValueError(f"Expected a delete file, got a data file: {delete_file.file_path}")
+        if self._transaction.table_metadata.format_version >= 3 and delete_file.file_format != FileFormat.PUFFIN:
+            raise ValueError(f"Only deletion vectors can be added to format version 3 tables: {delete_file.file_path}")
+        self._added_delete_files.append(delete_file)
+        return self
+
+    def _add_written_delete_file(self, delete_file: DataFile) -> _RowDelta:
+        """Add a delete file written for this operation, so it is removed again if the operation fails."""
+        self._written_delete_file_paths.add(delete_file.file_path)
+        return self.add_delete_file(delete_file)
+
+    def remove_delete_file(self, delete_file: DataFile) -> _RowDelta:
+        """Remove a delete file that is replaced by this operation, such as a superseded deletion vector."""
+        self._removed_delete_files.add(delete_file)
+        return self
+
+    def validate_data_files_exist(self, data_files: set[DataFile]) -> _RowDelta:
+        """Require that the given data files are neither removed nor receive new deletes concurrently."""
+        self._referenced_data_files |= data_files
+        return self
+
+    def _delete_written_data_files(self) -> None:
+        super()._delete_written_data_files()
+        for path in self._written_delete_file_paths:
+            try:
+                self._io.delete(path)
+            except Exception:
+                logger.warning("Failed to delete uncommitted delete file: %s", path, exc_info=True)
+        self._written_delete_file_paths.clear()
+
+    @property
+    def _has_changes(self) -> bool:
+        return bool(self._added_data_files or self._deleted_data_files or self._added_delete_files or self._removed_delete_files)
+
+    def _commit(self) -> UpdatesAndRequirements:
+        if not self._has_changes:
+            return (), ()
+        # Mirrors Java's BaseRowDelta: only adding deletes is a DELETE, anything else an OVERWRITE
+        if self._added_delete_files and not self._added_data_files and not self._deleted_data_files:
+            self._operation = Operation.DELETE
+        else:
+            self._operation = Operation.OVERWRITE
+        return super()._commit()
+
+    def _update_summary(self, collector: SnapshotSummaryCollector) -> None:
+        schema = self.schema()
+        specs = self._transaction.table_metadata.specs()
+        for delete_file in self._added_delete_files:
+            collector.add_file(delete_file, schema=schema, partition_spec=specs[delete_file.spec_id])
+        for delete_file in self._removed_delete_files:
+            collector.remove_file(delete_file, schema=schema, partition_spec=specs[delete_file.spec_id])
+
+    def _manifests(self) -> list[ManifestFile]:
+        return self._write_added_delete_manifests() + super()._manifests()
+
+    def _write_added_delete_manifests(self) -> list[ManifestFile]:
+        by_spec: dict[int, list[DataFile]] = defaultdict(list)
+        for delete_file in self._added_delete_files:
+            by_spec[delete_file.spec_id].append(delete_file)
+
+        manifests = []
+        for spec_id, delete_files in by_spec.items():
+            with self.new_manifest_writer(self.spec(spec_id), content=ManifestContent.DELETES) as writer:
+                for delete_file in delete_files:
+                    writer.add(
+                        ManifestEntry.from_args(
+                            status=ManifestEntryStatus.ADDED,
+                            snapshot_id=self._snapshot_id,
+                            sequence_number=None,
+                            file_sequence_number=None,
+                            data_file=delete_file,
+                        )
+                    )
+            manifests.append(writer.to_manifest_file())
+        return manifests
+
+    def _existing_manifests(self) -> list[ManifestFile]:
+        """Carry the parent's manifests forward, rewriting delete manifests that hold a removed delete file."""
+        if self._parent_snapshot_id is None:
+            if self._removed_delete_files:
+                raise ValidationException("Cannot remove delete files from a table without snapshots")
+            return []
+
+        parent = self._transaction.table_metadata.snapshot_by_id(self._parent_snapshot_id)
+        if parent is None:
+            raise ValueError(f"Snapshot could not be found: {self._parent_snapshot_id}")
+
+        existing_manifests = []
+        found = DeleteFileSet()
+        for manifest in parent.manifests(io=self._io):
+            if manifest.content != ManifestContent.DELETES or not self._removed_delete_files:
+                existing_manifests.append(manifest)
+                continue
+
+            entries = manifest.fetch_manifest_entry(io=self._io, discard_deleted=True)
+            if not any(entry.data_file in self._removed_delete_files for entry in entries):
+                existing_manifests.append(manifest)
+                continue
+
+            with self.new_manifest_writer(self.spec(manifest.partition_spec_id), content=ManifestContent.DELETES) as writer:
+                for entry in entries:
+                    if entry.data_file in self._removed_delete_files:
+                        found.add(entry.data_file)
+                        writer.delete(entry)
+                    else:
+                        writer.existing(entry)
+            existing_manifests.append(writer.to_manifest_file())
+
+        if missing := [delete_file.file_path for delete_file in self._removed_delete_files if delete_file not in found]:
+            raise ValidationException(f"Missing required delete files to remove: {', '.join(sorted(missing))}")
+
+        return existing_manifests
+
+    def _deleted_entries(self) -> list[ManifestEntry]:
+        """Return no separate entries; removed delete files are recorded in their rewritten delete manifests."""
+        return []
+
+    def _validate_concurrency(self) -> None:
+        """Run the base validation, and check the referenced data files still exist and have no new deletes."""
+        from pyiceberg.table.update.validate import _validate_data_files_exist, _validate_no_new_deletes_for_data_files
+
+        super()._validate_concurrency()
+
+        if self._commit_window is None or self._commit_window.is_empty() or self._commit_window.head is None:
+            return
+
+        if self._referenced_data_files:
+            table = self._transaction._table
+            head = self._commit_window.head
+            base = self._commit_window.base
+            _validate_data_files_exist(table, head, self._referenced_data_files, base)
+            _validate_no_new_deletes_for_data_files(table, head, None, self._referenced_data_files, base)
+
+
 class UpdateSnapshot:
     _transaction: Transaction
     _io: FileIO
@@ -957,6 +1130,16 @@ class UpdateSnapshot:
 
     def delete(self) -> _DeleteFiles:
         return _DeleteFiles(
+            operation=Operation.DELETE,
+            transaction=self._transaction,
+            io=self._io,
+            branch=self._branch,
+            snapshot_properties=self._snapshot_properties,
+        )
+
+    def row_delta(self, commit_uuid: uuid.UUID | None = None) -> _RowDelta:
+        return _RowDelta(
+            commit_uuid=commit_uuid,
             operation=Operation.DELETE,
             transaction=self._transaction,
             io=self._io,

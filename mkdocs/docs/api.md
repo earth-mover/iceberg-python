@@ -407,6 +407,15 @@ long: [[4.896029,-122.431297,6.0989],[6.56667]]
 
 In the case of `tbl.delete(delete_filter="city == 'Groningen'")`, the whole Parquet file will be dropped without checking it contents, since from the Iceberg metadata PyIceberg can derive that all the content in the file matches the predicate.
 
+By default, deletes are copy-on-write: a Parquet file that contains both matching and non-matching rows is rewritten without the matching rows. On a [format version 3](format-version-3.md#merge-on-read-deletes) table with the `write.delete.mode` table property set to `merge-on-read`, the matching rows are instead marked as deleted with a deletion vector, and the data files are left untouched. On v1 and v2 tables, `merge-on-read` falls back to copy-on-write with a warning.
+
+```python
+with tbl.transaction() as transaction:
+    transaction.set_properties({"write.delete.mode": "merge-on-read"})
+
+tbl.delete(delete_filter="city == 'Paris'")
+```
+
 ### Partial overwrites
 
 When using the `overwrite` API, you can use an `overwrite_filter` to delete data that matches the filter before appending new data into the table. For example, consider the following Iceberg table:

@@ -14,11 +14,15 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from dataclasses import dataclass
+from types import TracebackType
 from typing import TYPE_CHECKING
 
 import zstandard
 from pydantic import Field
 
+from pyiceberg import __version__
+from pyiceberg.io import OutputFile
 from pyiceberg.typedef import IcebergBaseModel
 from pyiceberg.utils.deprecated import deprecated
 
@@ -27,6 +31,8 @@ if TYPE_CHECKING:
 
 # Short for: Puffin Fratercula arctica, version 1
 MAGIC_BYTES = b"PFA1"
+# Footer trailer: footer payload size (4 bytes), flags (4 bytes) and the closing magic
+_FOOTER_TRAILER_SIZE = 12
 
 
 class PuffinBlobMetadata(IcebergBaseModel):
@@ -82,3 +88,90 @@ class PuffinFile:
         from pyiceberg.table.deletion_vector import deletion_vectors_from_puffin_file  # local import avoids the cycle
 
         return {dv.referenced_data_file: dv.to_vector() for dv in deletion_vectors_from_puffin_file(self)}
+
+
+@dataclass(frozen=True)
+class PuffinBlob:
+    """A blob to write into a Puffin file: its metadata and serialized payload."""
+
+    metadata: PuffinBlobMetadata
+    payload: bytes
+
+
+class PuffinWriter:
+    """Assembles a Puffin file from blobs and writes it to an output file.
+
+    The writer is blob-agnostic: callers supply already-serialized blobs (for example via
+    ``DeletionVector.to_blob()``). The offset and length of each blob are assigned when it is
+    added, and the file is written on ``close()`` (or on exiting the context manager without
+    an exception), after which ``file_size`` holds the size of the written file.
+    """
+
+    closed: bool
+    file_size: int | None
+    _output_file: OutputFile
+    _blobs: list[PuffinBlob]
+    _next_offset: int
+    _created_by: str
+
+    def __init__(self, output_file: OutputFile, created_by: str | None = None) -> None:
+        self.closed = False
+        self.file_size = None
+        self._output_file = output_file
+        self._blobs = []
+        self._next_offset = len(MAGIC_BYTES)
+        self._created_by = created_by if created_by is not None else f"PyIceberg version {__version__}"
+
+    def __enter__(self) -> "PuffinWriter":
+        """Open the writer."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Write the Puffin file, unless the body raised."""
+        if exc_type is not None:
+            # Skip writing a half-populated file
+            self.closed = True
+            return
+        self.close()
+
+    @property
+    def location(self) -> str:
+        """Return the location of the output file."""
+        return self._output_file.location
+
+    def add_blob(self, blob: PuffinBlob) -> PuffinBlobMetadata:
+        """Add a blob and return its metadata with the offset and length it has in the file."""
+        if self.closed:
+            raise RuntimeError("Cannot add blob to closed Puffin writer")
+        metadata = blob.metadata.model_copy(update={"offset": self._next_offset, "length": len(blob.payload)})
+        self._blobs.append(PuffinBlob(metadata=metadata, payload=blob.payload))
+        self._next_offset += len(blob.payload)
+        return metadata
+
+    def close(self) -> int:
+        """Write the blobs and the footer to the output file and return the size of the file."""
+        if self.closed:
+            raise RuntimeError("Puffin writer is already closed")
+        self.closed = True
+
+        footer = Footer(blobs=[blob.metadata for blob in self._blobs], properties={"created-by": self._created_by})
+        footer_payload = footer.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8")
+
+        with self._output_file.create(overwrite=True) as output_stream:
+            output_stream.write(MAGIC_BYTES)
+            for blob in self._blobs:
+                output_stream.write(blob.payload)
+            output_stream.write(MAGIC_BYTES)
+            output_stream.write(footer_payload)
+            output_stream.write(len(footer_payload).to_bytes(4, byteorder="little"))
+            # Flags: the footer payload is not compressed
+            output_stream.write((0).to_bytes(4, byteorder="little"))
+            output_stream.write(MAGIC_BYTES)
+
+        self.file_size = self._next_offset + len(MAGIC_BYTES) + len(footer_payload) + _FOOTER_TRAILER_SIZE
+        return self.file_size

@@ -92,6 +92,7 @@ Iceberg tables support table properties to configure table behavior.
 | `write.py-location-provider.impl`        | String of form `module.ClassName`  | null                       | Optional, [custom `LocationProvider`](configuration.md#loading-a-custom-location-provider) implementation                                            |
 | `write.data.path`                        | String pointing to location        | `{metadata.location}/data` | Sets the location under which data is written.                                                                                                       |
 | `write.metadata.path`                    | String pointing to location        | `{metadata.location}/metadata` | Sets the location under which metadata is written.                                                                                                                                                                  |
+| `write.delete.mode`                      | `{copy-on-write,merge-on-read}`    | copy-on-write              | How `delete()` removes rows from partially matching data files. `merge-on-read` writes [deletion vectors](format-version-3.md#merge-on-read-deletes) on format version 3 tables, and falls back to copy-on-write on v1 and v2 tables. |
 
 ### Table behavior options
 
