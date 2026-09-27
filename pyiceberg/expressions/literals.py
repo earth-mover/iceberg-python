@@ -41,11 +41,15 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IcebergType,
     IntegerType,
     LongType,
     StringType,
+    TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
     TimestamptzType,
     TimeType,
     UUIDType,
@@ -57,10 +61,15 @@ from pyiceberg.utils.datetime import (
     days_to_date,
     micros_to_days,
     micros_to_timestamp,
+    nanos_to_days,
     time_str_to_micros,
     time_to_micros,
     timestamp_to_micros,
+    timestamp_to_nanos,
     timestamptz_to_micros,
+    timestamptz_to_nanos,
+    to_human_timestamp_ns,
+    to_human_timestamptz_ns,
 )
 from pyiceberg.utils.decimal import decimal_to_unscaled, unscaled_to_decimal
 from pyiceberg.utils.singleton import Singleton
@@ -353,6 +362,14 @@ class LongLiteral(Literal[int]):
     def _(self, _: TimestamptzType) -> Literal[int]:
         return TimestampLiteral(self.value)
 
+    @to.register(TimestampNanoType)
+    def _(self, _: TimestampNanoType) -> Literal[int]:
+        return _nanos_literal(self.value, TimestampNanoLiteral)
+
+    @to.register(TimestamptzNanoType)
+    def _(self, _: TimestamptzNanoType) -> Literal[int]:
+        return _nanos_literal(self.value, TimestamptzNanoLiteral)
+
     @to.register(DecimalType)
     def _(self, type_var: DecimalType) -> Literal[Decimal]:
         unscaled = Decimal(self.value)
@@ -457,6 +474,14 @@ class DateLiteral(Literal[int]):
     def _(self, _: DateType) -> Literal[int]:
         return self
 
+    @to.register(TimestampNanoType)
+    def _(self, _: TimestampNanoType) -> Literal[int]:
+        return _nanos_literal(self.value * NANOS_PER_DAY, TimestampNanoLiteral)
+
+    @to.register(TimestamptzNanoType)
+    def _(self, _: TimestamptzNanoType) -> Literal[int]:
+        return _nanos_literal(self.value * NANOS_PER_DAY, TimestamptzNanoLiteral)
+
 
 class TimeLiteral(Literal[int]):
     def __init__(self, value: int) -> None:
@@ -500,6 +525,79 @@ class TimestampLiteral(Literal[int]):
     @to.register(DateType)
     def _(self, _: DateType) -> Literal[int]:
         return DateLiteral(micros_to_days(self.value))
+
+    @to.register(TimestampNanoType)
+    def _(self, _: TimestampNanoType) -> Literal[int]:
+        return _nanos_literal(self.value * 1_000, TimestampNanoLiteral)
+
+    @to.register(TimestamptzNanoType)
+    def _(self, _: TimestamptzNanoType) -> Literal[int]:
+        return _nanos_literal(self.value * 1_000, TimestamptzNanoLiteral)
+
+
+NANOS_PER_DAY = 86_400 * 1_000_000_000
+
+
+def _nanos_literal(nanos: int, literal_type: type[_TimestampNanoLiteralBase]) -> Literal[int]:
+    """Wrap nanoseconds from epoch in a nanosecond timestamp literal, or AboveMax/BelowMin when out of the long range."""
+    if LongType.max < nanos:
+        return LongAboveMax()
+    elif LongType.min > nanos:
+        return LongBelowMin()
+    return literal_type(nanos)
+
+
+class _TimestampNanoLiteralBase(Literal[int]):
+    """Base for nanosecond timestamp literals; the value is nanoseconds from 1970-01-01T00:00:00."""
+
+    def __init__(self, value: int) -> None:
+        super().__init__(value, int)
+
+    def increment(self) -> Literal[int]:
+        return type(self)(self.value + 1)
+
+    def decrement(self) -> Literal[int]:
+        return type(self)(self.value - 1)
+
+    @singledispatchmethod
+    def to(self, type_var: IcebergType) -> Literal:  # type: ignore
+        raise TypeError(f"Cannot convert {type(self).__name__} into {type_var}")
+
+    @to.register(TimestampNanoType)
+    def _(self, _: TimestampNanoType) -> Literal[int]:
+        return self if isinstance(self, TimestampNanoLiteral) else TimestampNanoLiteral(self.value)
+
+    @to.register(TimestamptzNanoType)
+    def _(self, _: TimestamptzNanoType) -> Literal[int]:
+        return self if isinstance(self, TimestamptzNanoLiteral) else TimestamptzNanoLiteral(self.value)
+
+    @to.register(TimestampType)
+    def _(self, _: TimestampType) -> Literal[int]:
+        return TimestampLiteral(self.value // 1_000)
+
+    @to.register(TimestamptzType)
+    def _(self, _: TimestamptzType) -> Literal[int]:
+        return TimestampLiteral(self.value // 1_000)
+
+    @to.register(DateType)
+    def _(self, _: DateType) -> Literal[int]:
+        return DateLiteral(nanos_to_days(self.value))
+
+
+class TimestampNanoLiteral(_TimestampNanoLiteralBase):
+    """Literal for timestamp_ns values, in nanoseconds from 1970-01-01T00:00:00."""
+
+    @model_serializer
+    def ser_model(self) -> str:
+        return to_human_timestamp_ns(self.root)
+
+
+class TimestamptzNanoLiteral(_TimestampNanoLiteralBase):
+    """Literal for timestamptz_ns values, in nanoseconds from 1970-01-01T00:00:00+00:00."""
+
+    @model_serializer
+    def ser_model(self) -> str:
+        return to_human_timestamptz_ns(self.root)
 
 
 class DecimalLiteral(Literal[Decimal]):
@@ -620,6 +718,14 @@ class StringLiteral(Literal[str]):
     @to.register(TimestamptzType)
     def _(self, _: TimestamptzType) -> Literal[int]:
         return TimestampLiteral(timestamptz_to_micros(self.value))
+
+    @to.register(TimestampNanoType)
+    def _(self, _: TimestampNanoType) -> Literal[int]:
+        return _nanos_literal(timestamp_to_nanos(self.value), TimestampNanoLiteral)
+
+    @to.register(TimestamptzNanoType)
+    def _(self, _: TimestamptzNanoType) -> Literal[int]:
+        return _nanos_literal(timestamptz_to_nanos(self.value), TimestamptzNanoLiteral)
 
     @to.register(UUIDType)
     def _(self, _: UUIDType) -> Literal[bytes]:
@@ -765,3 +871,57 @@ class BinaryLiteral(Literal[bytes]):
             raise TypeError(
                 f"Cannot convert BinaryLiteral into {type_var}, different length: {UUID_BYTES_LENGTH} <> {len(self.value)}"
             )
+
+    @to.register(GeometryType)
+    def _(self, _: GeometryType) -> Literal[bytes]:
+        return GeometryLiteral(self.value)
+
+    @to.register(GeographyType)
+    def _(self, _: GeographyType) -> Literal[bytes]:
+        return GeographyLiteral(self.value)
+
+
+class GeometryLiteral(Literal[bytes]):
+    """A geometry value, encoded as WKB. Only equality is defined for geometry literals."""
+
+    def __init__(self, value: bytes) -> None:
+        super().__init__(value, bytes)
+
+    @model_serializer
+    def ser_model(self) -> str:
+        return self.root.hex()
+
+    @singledispatchmethod
+    def to(self, type_var: IcebergType) -> Literal:  # type: ignore
+        raise TypeError(f"Cannot convert GeometryLiteral into {type_var}")
+
+    @to.register(GeometryType)
+    def _(self, _: GeometryType) -> Literal[bytes]:
+        return self
+
+    @to.register(BinaryType)
+    def _(self, _: BinaryType) -> Literal[bytes]:
+        return BinaryLiteral(self.value)
+
+
+class GeographyLiteral(Literal[bytes]):
+    """A geography value, encoded as WKB. Only equality is defined for geography literals."""
+
+    def __init__(self, value: bytes) -> None:
+        super().__init__(value, bytes)
+
+    @model_serializer
+    def ser_model(self) -> str:
+        return self.root.hex()
+
+    @singledispatchmethod
+    def to(self, type_var: IcebergType) -> Literal:  # type: ignore
+        raise TypeError(f"Cannot convert GeographyLiteral into {type_var}")
+
+    @to.register(GeographyType)
+    def _(self, _: GeographyType) -> Literal[bytes]:
+        return self
+
+    @to.register(BinaryType)
+    def _(self, _: BinaryType) -> Literal[bytes]:
+        return BinaryLiteral(self.value)

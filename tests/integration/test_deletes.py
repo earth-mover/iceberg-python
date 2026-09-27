@@ -60,7 +60,7 @@ def test_table(session_catalog: RestCatalog) -> Generator[Table, None, None]:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_partitioned_table_delete_full_file(spark: SparkSession, session_catalog: RestCatalog, format_version: int) -> None:
     identifier = "default.table_partitioned_delete"
 
@@ -95,7 +95,7 @@ def test_partitioned_table_delete_full_file(spark: SparkSession, session_catalog
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_partitioned_table_rewrite(spark: SparkSession, session_catalog: RestCatalog, format_version: int) -> None:
     identifier = "default.table_partitioned_delete"
 
@@ -130,7 +130,7 @@ def test_partitioned_table_rewrite(spark: SparkSession, session_catalog: RestCat
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_rewrite_partitioned_table_with_null(spark: SparkSession, session_catalog: RestCatalog, format_version: int) -> None:
     identifier = "default.table_partitioned_delete"
 
@@ -165,7 +165,7 @@ def test_rewrite_partitioned_table_with_null(spark: SparkSession, session_catalo
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 @pytest.mark.filterwarnings("ignore:Delete operation did not match any records")
 def test_partitioned_table_no_match(spark: SparkSession, session_catalog: RestCatalog, format_version: int) -> None:
     identifier = "default.table_partitioned_delete"
@@ -197,7 +197,7 @@ def test_partitioned_table_no_match(spark: SparkSession, session_catalog: RestCa
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_delete_partitioned_table_positional_deletes(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.table_partitioned_delete"
 
@@ -244,7 +244,7 @@ def test_delete_partitioned_table_positional_deletes(spark: SparkSession, sessio
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_delete_partitioned_table_positional_deletes_empty_batch(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.test_delete_partitioned_table_positional_deletes_empty_batch"
 
@@ -312,7 +312,7 @@ def test_delete_partitioned_table_positional_deletes_empty_batch(spark: SparkSes
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_read_multiple_batches_in_task_with_position_deletes(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.test_read_multiple_batches_in_task_with_position_deletes"
 
@@ -365,7 +365,7 @@ def test_read_multiple_batches_in_task_with_position_deletes(spark: SparkSession
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_overwrite_partitioned_table(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.table_partitioned_delete"
 
@@ -415,7 +415,7 @@ def test_overwrite_partitioned_table(spark: SparkSession, session_catalog: RestC
 
 
 @pytest.mark.integration
-@pytest.mark.filterwarnings("ignore:Merge on read is not yet supported, falling back to copy-on-write")
+@pytest.mark.filterwarnings("ignore:Merge-on-read deletes require format version 3")
 def test_partitioned_table_positional_deletes_sequence_number(spark: SparkSession, session_catalog: RestCatalog) -> None:
     identifier = "default.table_partitioned_delete_sequence_number"
 
@@ -899,7 +899,7 @@ def test_overwrite_with_filter_case_insensitive(test_table: Table) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 @pytest.mark.filterwarnings("ignore:Delete operation did not match any records")
 def test_delete_on_empty_table(spark: SparkSession, session_catalog: RestCatalog, format_version: int) -> None:
     identifier = f"default.test_delete_on_empty_table_{format_version}"

@@ -407,6 +407,15 @@ long: [[4.896029,-122.431297,6.0989],[6.56667]]
 
 In the case of `tbl.delete(delete_filter="city == 'Groningen'")`, the whole Parquet file will be dropped without checking it contents, since from the Iceberg metadata PyIceberg can derive that all the content in the file matches the predicate.
 
+By default, deletes are copy-on-write: a Parquet file that contains both matching and non-matching rows is rewritten without the matching rows. On a [format version 3](format-version-3.md#merge-on-read-deletes) table with the `write.delete.mode` table property set to `merge-on-read`, the matching rows are instead marked as deleted with a deletion vector, and the data files are left untouched. On v1 and v2 tables, `merge-on-read` falls back to copy-on-write with a warning.
+
+```python
+with tbl.transaction() as transaction:
+    transaction.set_properties({"write.delete.mode": "merge-on-read"})
+
+tbl.delete(delete_filter="city == 'Paris'")
+```
+
 ### Partial overwrites
 
 When using the `overwrite` API, you can use an `overwrite_filter` to delete data that matches the filter before appending new data into the table. For example, consider the following Iceberg table:
@@ -676,7 +685,7 @@ status: int8 not null
 snapshot_id: int64 not null
 sequence_number: int64 not null
 file_sequence_number: int64 not null
-data_file: struct<content: int8 not null, file_path: string not null, file_format: string not null, partition: struct<> not null, record_count: int64 not null, file_size_in_bytes: int64 not null, column_sizes: map<int32, int64>, value_counts: map<int32, int64>, null_value_counts: map<int32, int64>, nan_value_counts: map<int32, int64>, lower_bounds: map<int32, binary>, upper_bounds: map<int32, binary>, key_metadata: binary, split_offsets: list<item: int64>, equality_ids: list<item: int32>, sort_order_id: int32> not null
+data_file: struct<content: int8 not null, file_path: string not null, file_format: string not null, partition: struct<> not null, record_count: int64 not null, file_size_in_bytes: int64 not null, column_sizes: map<int32, int64>, value_counts: map<int32, int64>, null_value_counts: map<int32, int64>, nan_value_counts: map<int32, int64>, lower_bounds: map<int32, binary>, upper_bounds: map<int32, binary>, key_metadata: binary, split_offsets: list<item: int64>, equality_ids: list<item: int32>, sort_order_id: int32, first_row_id: int64, referenced_data_file: string, content_offset: int64, content_size_in_bytes: int64> not null
   child 0, content: int8 not null
   child 1, file_path: string not null
   child 2, file_format: string not null
@@ -713,6 +722,10 @@ data_file: struct<content: int8 not null, file_path: string not null, file_forma
   child 14, equality_ids: list<item: int32>
       child 0, item: int32
   child 15, sort_order_id: int32
+  child 16, first_row_id: int64
+  child 17, referenced_data_file: string
+  child 18, content_offset: int64
+  child 19, content_size_in_bytes: int64
 readable_metrics: struct<city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string> not null, lat: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null, long: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null>
   child 0, city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string> not null
       child 0, column_size: int64
@@ -985,6 +998,10 @@ split_offsets: list<item: int64>
 equality_ids: list<item: int32>
   child 0, item: int32
 sort_order_id: int32
+first_row_id: int64
+referenced_data_file: string
+content_offset: int64
+content_size_in_bytes: int64
 readable_metrics: struct<city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: large_string, upper_bound: large_string> not null, lat: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null, long: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: double, upper_bound: double> not null>
   child 0, city: struct<column_size: int64, value_count: int64, null_value_count: int64, nan_value_count: int64, lower_bound: string, upper_bound: string> not null
       child 0, column_size: int64
@@ -1813,6 +1830,46 @@ The low level API `plan_files` methods returns a set of tasks that provide the f
 ```
 
 In this case it is up to the engine itself to filter the file itself. Below, `to_arrow()` and `to_duckdb()` that already do this for you.
+
+### Row lineage metadata columns
+
+On format version 3 tables, the reserved row lineage columns `_row_id` and `_last_updated_sequence_number` can be
+requested in `selected_fields`. They are not part of the table schema, and are appended after the table columns in the
+order they are requested:
+
+```python
+scan = table.scan(selected_fields=("VendorID", "_row_id", "_last_updated_sequence_number"))
+scan.to_arrow()
+```
+
+A row without a stored value inherits `_row_id` from its data file's `first_row_id` plus the row's position in the file,
+and `_last_updated_sequence_number` from the data sequence number of the file. Both are null for rows in data files
+added before row lineage was enabled. The columns are read-only: appending a dataframe that contains them is rejected by
+the schema compatibility check.
+
+Rows keep their lineage when `delete()`, `overwrite()` or `upsert()` rewrites a data file (copy-on-write): the copied
+rows' `_row_id` and `_last_updated_sequence_number` are stored in the rewritten file. Merge-on-read deletes leave the
+data files in place, so row ids are unchanged as well. Rows that `upsert()` updates are written as new rows with new
+row ids. Copied rows still count toward the snapshot's `added-rows`, so `next-row-id` advances past them.
+
+### Variant columns
+
+On format version 3 tables, `variant` columns are read as a struct of two binaries, `metadata` and `value`, holding
+the Variant binary encoding. `pyiceberg.variant` decodes a value to JSON or to Python objects:
+
+```python
+from pyiceberg.variant import to_json, to_python
+
+for row in table.scan(selected_fields=("id", "v")).to_arrow().to_pylist():
+    v = row["v"]
+    if v is not None:
+        print(row["id"], to_json(v["metadata"], v["value"]), to_python(v["metadata"], v["value"]))
+```
+
+`to_python` returns `dict`, `list`, `str`, `int`, `float`, `Decimal`, `bytes`, `date`, `time`, `datetime` or `UUID`
+values. Shredded variant files (with a `typed_value` field) cannot be read yet and raise `NotImplementedError` when the
+column is projected. Writing variant columns is not supported until PyArrow can annotate the Parquet `VARIANT`
+logical type.
 
 ### Apache Arrow
 

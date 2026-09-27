@@ -440,3 +440,39 @@ for catalog_name, catalog in catalogs.items():
             AS SELECT number, letter, extra FROM {catalog_name}.default.test_incremental_read
             """
     )
+
+
+# Format-version 3 fixtures that need the Iceberg Java Table API (nanosecond timestamps, geometry,
+# column defaults, unknown) are provisioned by dev/provision_v3.scala inside the Spark container.
+def provision_v3_java_fixtures() -> None:
+    import os
+    import subprocess
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "provision_v3.scala")
+    container = os.environ.get("PYICEBERG_SPARK_CONTAINER", "pyiceberg-spark")
+    subprocess.run(["docker", "cp", script, f"{container}:/tmp/provision_v3.scala"], check=True)
+    result = subprocess.run(
+        [
+            "docker",
+            "exec",
+            "-e",
+            "AWS_REGION=us-east-1",
+            "-e",
+            "AWS_ACCESS_KEY_ID=admin",
+            "-e",
+            "AWS_SECRET_ACCESS_KEY=password",
+            container,
+            "bash",
+            "-c",
+            "cd /tmp && $SPARK_HOME/bin/spark-shell --master local[1] --conf spark.ui.enabled=false "
+            '--driver-java-options "-Duser.home=/tmp" < /tmp/provision_v3.scala',
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if "PROVISION_V3_DONE" not in result.stdout:
+        raise RuntimeError(f"provision_v3.scala did not complete:\n{result.stdout[-4000:]}")
+
+
+provision_v3_java_fixtures()

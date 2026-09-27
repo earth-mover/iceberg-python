@@ -40,18 +40,30 @@ from pyiceberg.expressions.visitors import (
     _InclusiveMetricsEvaluator,
     bind,
     expression_evaluator,
+    extract_field_ids,
     inclusive_projection,
     manifest_evaluator,
 )
 from pyiceberg.io import FileIO, load_file_io
-from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestEntry, ManifestEntryStatus, ManifestFile
+from pyiceberg.manifest import (
+    DataFile,
+    DataFileContent,
+    FileFormat,
+    ManifestContent,
+    ManifestEntry,
+    ManifestEntryStatus,
+    ManifestFile,
+)
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, UNPARTITIONED_PARTITION_SPEC, PartitionKey, PartitionSpec
-from pyiceberg.schema import Schema
+from pyiceberg.schema import Schema, prune_columns
+from pyiceberg.table.delete_file import DeleteFileSet
 from pyiceberg.table.delete_file_index import DeleteFileIndex
+from pyiceberg.table.deletion_vector import DeletionVector
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
-from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadata
+from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata
+from pyiceberg.table.metadata_columns import is_metadata_column, project_schema, schema_with_row_lineage
 from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import (
@@ -111,6 +123,7 @@ if TYPE_CHECKING:
     import pandas as pd
     import polars as pl
     import pyarrow as pa
+    import pyarrow.compute as pc
     import ray
     from duckdb import DuckDBPyConnection
     from pyiceberg_core.datafusion import IcebergDataFusionTable
@@ -332,7 +345,7 @@ class Transaction:
         Returns:
             The alter table builder.
         """
-        if format_version not in {1, 2}:
+        if not 1 <= format_version <= SUPPORTED_TABLE_FORMAT_VERSION:
             raise ValueError(f"Unsupported table format version: {format_version}")
 
         if format_version < self.table_metadata.format_version:
@@ -565,7 +578,7 @@ class Transaction:
                     table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
                 )
                 for data_file in data_files:
-                    append_files.append_data_file(data_file)
+                    append_files._append_written_data_file(data_file)
 
     def dynamic_partition_overwrite(
         self, df: pa.Table, snapshot_properties: dict[str, str] = EMPTY_DICT, branch: str | None = MAIN_BRANCH
@@ -638,7 +651,7 @@ class Transaction:
         with self._append_snapshot_producer(snapshot_properties, branch=branch) as append_files:
             append_files.commit_uuid = append_snapshot_commit_uuid
             for data_file in data_files:
-                append_files.append_data_file(data_file)
+                append_files._append_written_data_file(data_file)
 
     def overwrite(
         self,
@@ -736,7 +749,7 @@ class Transaction:
                     table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
                 )
                 for data_file in data_files:
-                    append_files.append_data_file(data_file)
+                    append_files._append_written_data_file(data_file)
 
     def delete(
         self,
@@ -753,6 +766,8 @@ class Transaction:
 
             - DELETE: In case existing Parquet files can be dropped completely.
             - OVERWRITE: In case existing Parquet files need to be rewritten to drop rows that match the delete filter.
+            - DELETE: In case of a format version 3 table with `write.delete.mode=merge-on-read`, rows in
+              partially matching files are marked as deleted with deletion vectors instead of rewriting the files.
 
         Args:
             delete_filter: A boolean expression to delete rows from a table
@@ -762,11 +777,19 @@ class Transaction:
         """
         from pyiceberg.io.pyarrow import ArrowScan, _dataframe_to_data_files, _expression_to_complementary_pyarrow
 
+        use_deletion_vectors = False
         if (
             self.table_metadata.properties.get(TableProperties.DELETE_MODE, TableProperties.DELETE_MODE_DEFAULT)
             == TableProperties.DELETE_MODE_MERGE_ON_READ
         ):
-            warnings.warn("Merge on read is not yet supported, falling back to copy-on-write", stacklevel=2)
+            if self.table_metadata.format_version < 3:
+                warnings.warn(
+                    "Merge-on-read deletes require format version 3 (deletion vectors); falling back to copy-on-write",
+                    stacklevel=2,
+                )
+            else:
+                # The delete phase of an overwrite (which passes an isolation operation) keeps copy-on-write
+                use_deletion_vectors = _isolation_operation is None
 
         if isinstance(delete_filter, str):
             delete_filter = _parse_row_filter(delete_filter)
@@ -777,7 +800,15 @@ class Transaction:
             delete_snapshot.delete_by_predicate(delete_filter, case_sensitive)
 
         # Check if there are any files that require an actual rewrite of a data file
-        if delete_snapshot.rewrites_needed is True:
+        if delete_snapshot.rewrites_needed is True and use_deletion_vectors:
+            self._delete_with_deletion_vectors(
+                delete_filter=delete_filter,
+                case_sensitive=case_sensitive,
+                snapshot_properties=snapshot_properties,
+                branch=branch,
+                starting_snapshot_id=delete_snapshot._starting_snapshot_id,
+            )
+        elif delete_snapshot.rewrites_needed is True:
             bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
             preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, self.table_metadata.schema())
 
@@ -788,6 +819,15 @@ class Transaction:
 
             commit_uuid = uuid.uuid4()
             counter = itertools.count(0)
+
+            # Rows copied into the rewritten files keep their row IDs and last updated sequence numbers,
+            # which are written as physical columns (see https://iceberg.apache.org/spec/#row-lineage)
+            projected_schema = self.table_metadata.schema()
+            preserve_row_lineage = False
+            if self.table_metadata.format_version >= 3:
+                if (lineage_schema := schema_with_row_lineage(projected_schema)) is not None:
+                    projected_schema = lineage_schema
+                    preserve_row_lineage = True
 
             replaced_files: list[tuple[DataFile, list[DataFile]]] = []
             # This will load the Parquet file into memory, including:
@@ -801,7 +841,7 @@ class Transaction:
                 df = ArrowScan(
                     table_metadata=self.table_metadata,
                     io=self._table.io,
-                    projected_schema=self.table_metadata.schema(),
+                    projected_schema=projected_schema,
                     row_filter=AlwaysTrue(),
                 ).to_table(tasks=[original_file])
                 filtered_df = df.filter(preserve_row_filter)
@@ -820,6 +860,7 @@ class Transaction:
                                     table_metadata=self.table_metadata,
                                     write_uuid=commit_uuid,
                                     counter=counter,
+                                    preserve_row_lineage=preserve_row_lineage,
                                 )
                             ),
                         )
@@ -837,10 +878,70 @@ class Transaction:
                     for original_data_file, replaced_data_files in replaced_files:
                         overwrite_snapshot.delete_data_file(original_data_file)
                         for replaced_data_file in replaced_data_files:
-                            overwrite_snapshot.append_data_file(replaced_data_file)
+                            overwrite_snapshot._append_written_data_file(replaced_data_file)
 
         if not delete_snapshot.files_affected and not delete_snapshot.rewrites_needed:
             warnings.warn("Delete operation did not match any records", stacklevel=2)
+
+    def _delete_with_deletion_vectors(
+        self,
+        delete_filter: BooleanExpression,
+        case_sensitive: bool,
+        snapshot_properties: dict[str, str],
+        branch: str | None,
+        starting_snapshot_id: int | None,
+    ) -> None:
+        """Mark the rows matching the filter as deleted with deletion vectors (merge-on-read).
+
+        Each partially matching data file gets one deletion vector holding the matching positions
+        and the positions deleted before, replacing the file's previous deletion vector and
+        file-scoped position delete files.
+        """
+        from pyiceberg.io.pyarrow import _expression_to_complementary_pyarrow
+        from pyiceberg.table.deletion_vector import write_deletion_vectors
+
+        schema = self.table_metadata.schema()
+        bound_delete_filter = bind(schema, delete_filter, case_sensitive)
+        preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, schema)
+        filter_field_ids = extract_field_ids(bound_delete_filter)
+
+        file_scan = self._scan(row_filter=delete_filter, case_sensitive=case_sensitive)
+        if branch is not None:
+            file_scan = file_scan.use_ref(branch)
+
+        def _plan(task: FileScanTask) -> tuple[DataFile, DeletionVector, list[DataFile]] | None:
+            positions = _deleted_positions(self.table_metadata, self._table.io, task, filter_field_ids, preserve_row_filter)
+            if len(positions) == 0:
+                return None
+            deletion_vector = DeletionVector.from_positions(task.file.file_path, positions)
+            previous, replaced = _previous_deletes(self._table.io, task)
+            if previous is not None:
+                merged = previous.union(deletion_vector)
+                if merged.cardinality == previous.cardinality:
+                    # All matching rows were deleted before
+                    return None
+                deletion_vector = merged
+            return task.file, deletion_vector, replaced
+
+        executor = ExecutorFactory.get_or_create()
+        planned = [result for result in executor.map(_plan, file_scan.plan_files()) if result is not None]
+        if not planned:
+            return
+
+        commit_uuid = uuid.uuid4()
+        location = self._table.location_provider().new_data_location(f"00000-0-{commit_uuid}-00001-deletes.puffin")
+        with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).row_delta(commit_uuid) as row_delta:
+            row_delta._starting_snapshot_id = starting_snapshot_id
+            row_delta.delete_by_predicate(delete_filter, case_sensitive)
+            # Track the location before writing, so a partially written file is removed on failure
+            row_delta._written_delete_file_paths.add(location)
+            delete_files = write_deletion_vectors(self._table.io, location, [(data_file, dv) for data_file, dv, _ in planned])
+            for delete_file in delete_files:
+                row_delta._add_written_delete_file(delete_file)
+            for _, _, replaced in planned:
+                for replaced_delete_file in replaced:
+                    row_delta.remove_delete_file(replaced_delete_file)
+            row_delta.validate_data_files_exist({data_file for data_file, _, _ in planned})
 
     def upsert(
         self,
@@ -1284,6 +1385,66 @@ class CreateTableTransaction(Transaction):
         self._requirements = ()
 
         return self._table
+
+
+def _deleted_positions(
+    table_metadata: TableMetadata,
+    io: FileIO,
+    task: FileScanTask,
+    filter_field_ids: set[int],
+    preserve_row_filter: pc.Expression,
+) -> list[int]:
+    """Return the positions of the rows in the task's data file that the preserve filter does not keep.
+
+    The rows are read without applying existing deletes, so the positions are relative to the file.
+    """
+    import pyarrow.compute as pc
+
+    from pyiceberg.io.pyarrow import _ROW_POSITION_COLUMN, ArrowScan, _row_positions
+
+    projected_schema = prune_columns(table_metadata.schema(), filter_field_ids, select_full_types=False)
+    df = ArrowScan(table_metadata=table_metadata, io=io, projected_schema=projected_schema, row_filter=AlwaysTrue()).to_table(
+        tasks=[FileScanTask(task.file, sequence_number=task.sequence_number)]
+    )
+    if df.num_rows != task.file.record_count:
+        raise ValueError(f"Expected {task.file.record_count} rows in {task.file.file_path}, but read {df.num_rows}")
+
+    positions = _row_positions(0, df.num_rows)
+    kept = df.append_column(_ROW_POSITION_COLUMN, positions).filter(preserve_row_filter).column(_ROW_POSITION_COLUMN)
+    return pc.filter(positions, pc.invert(pc.is_in(positions, value_set=kept))).to_pylist()
+
+
+def _previous_deletes(io: FileIO, task: FileScanTask) -> tuple[DeletionVector | None, list[DataFile]]:
+    """Return the positions deleted by the task's position deletes, and the delete files a new deletion vector replaces.
+
+    A new deletion vector replaces the data file's previous deletion vector and its file-scoped position delete
+    files, as in Java. Partition-scoped position delete files are kept; their positions are merged in.
+    """
+    from pyiceberg.io.pyarrow import _read_deletes
+    from pyiceberg.table.delete_file_index import _referenced_data_file_path
+    from pyiceberg.table.deletion_vector import read_deletion_vectors
+
+    data_file_path = task.file.file_path
+    previous: DeletionVector | None = None
+    replaced: list[DataFile] = []
+    for delete_file in task.delete_files:
+        if delete_file.content != DataFileContent.POSITION_DELETES:
+            continue
+        if delete_file.file_format == FileFormat.PUFFIN:
+            vectors = [dv for dv in read_deletion_vectors(io, delete_file) if dv.referenced_data_file == data_file_path]
+            replaced.append(delete_file)
+        else:
+            positions = _read_deletes(io, delete_file).get(data_file_path)
+            vectors = (
+                [DeletionVector.from_positions(data_file_path, positions.to_pylist())]
+                if positions is not None and len(positions) > 0
+                else []
+            )
+            if data_file_path in (delete_file.referenced_data_file, _referenced_data_file_path(delete_file)):
+                replaced.append(delete_file)
+        for vector in vectors:
+            previous = vector if previous is None else previous.union(vector)
+    return previous, replaced
 
 
 class Namespace(IcebergRootModel[list[str]]):
@@ -2211,10 +2372,7 @@ class TableScan(BaseScan):
             else:
                 raise ValueError(f"Snapshot not found: {self.snapshot_id}")
 
-        if "*" in self.selected_fields:
-            return current_schema
-
-        return current_schema.select(*self.selected_fields, case_sensitive=self.case_sensitive)
+        return project_schema(current_schema, self.selected_fields, case_sensitive=self.case_sensitive)
 
     def use_ref(self: S, name: str) -> S:
         if self.snapshot_id is not None:
@@ -2237,18 +2395,22 @@ class FileScanTask(ScanTask):
     """Task representing a data file and its corresponding delete files."""
 
     file: DataFile
-    delete_files: set[DataFile]
+    delete_files: DeleteFileSet
     residual: BooleanExpression
+    sequence_number: int | None
 
     def __init__(
         self,
         data_file: DataFile,
-        delete_files: set[DataFile] | None = None,
+        delete_files: Iterable[DataFile] | None = None,
         residual: BooleanExpression = ALWAYS_TRUE,
+        sequence_number: int | None = None,
     ) -> None:
         self.file = data_file
-        self.delete_files = delete_files or set()
+        self.delete_files = DeleteFileSet(delete_files if delete_files is not None else [])
         self.residual = residual
+        # The data sequence number of the manifest entry, used to derive _last_updated_sequence_number
+        self.sequence_number = sequence_number
 
     @staticmethod
     def from_rest_response(
@@ -2263,21 +2425,13 @@ class FileScanTask(ScanTask):
 
         Returns:
             A FileScanTask with the converted data and delete files.
-
-        Raises:
-            NotImplementedError: If equality delete files are encountered.
         """
-        from pyiceberg.catalog.rest.scan_planning import RESTEqualityDeleteFile
-
         data_file = _rest_file_to_data_file(rest_task.data_file)
 
-        resolved_deletes: set[DataFile] = set()
+        resolved_deletes = DeleteFileSet()
         if rest_task.delete_file_references:
             for idx in rest_task.delete_file_references:
-                delete_file = delete_files[idx]
-                if isinstance(delete_file, RESTEqualityDeleteFile):
-                    raise NotImplementedError(f"PyIceberg does not yet support equality deletes: {delete_file.file_path}")
-                resolved_deletes.add(_rest_file_to_data_file(delete_file))
+                resolved_deletes.add(_rest_file_to_data_file(delete_files[idx]))
 
         return FileScanTask(
             data_file=data_file,
@@ -2288,7 +2442,7 @@ class FileScanTask(ScanTask):
 
 def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
     """Convert a REST content file to a manifest DataFile."""
-    from pyiceberg.catalog.rest.scan_planning import RESTDataFile
+    from pyiceberg.catalog.rest.scan_planning import RESTDataFile, RESTEqualityDeleteFile, RESTPositionDeleteFile
 
     if isinstance(rest_file, RESTDataFile):
         column_sizes = rest_file.column_sizes.to_dict() if rest_file.column_sizes else None
@@ -2314,6 +2468,11 @@ def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
         nan_value_counts=nan_value_counts,
         split_offsets=rest_file.split_offsets,
         sort_order_id=rest_file.sort_order_id,
+        equality_ids=rest_file.equality_ids if isinstance(rest_file, RESTEqualityDeleteFile) else None,
+        first_row_id=rest_file.first_row_id if isinstance(rest_file, RESTDataFile) else None,
+        referenced_data_file=rest_file.referenced_data_file if isinstance(rest_file, RESTPositionDeleteFile) else None,
+        content_offset=rest_file.content_offset if isinstance(rest_file, RESTPositionDeleteFile) else None,
+        content_size_in_bytes=rest_file.content_size_in_bytes if isinstance(rest_file, RESTPositionDeleteFile) else None,
     )
     data_file.spec_id = rest_file.spec_id
     return data_file
@@ -2444,9 +2603,11 @@ class DataScan(TableScan):
         if self.table_identifier is None:
             raise ValueError("REST scan planning requires a table identifier")
 
+        # Metadata columns are materialized client-side while reading the data files
+        select = [name for name in self.selected_fields if not is_metadata_column(name, self.case_sensitive)]
         request = PlanTableScanRequest(
             snapshot_id=self.snapshot_id,
-            select=list(self.selected_fields) if self.selected_fields != ("*",) else None,
+            select=None if "*" in select else select,
             filter=self.row_filter if self.row_filter != ALWAYS_TRUE else None,
             case_sensitive=self.case_sensitive,
         )
@@ -2624,10 +2785,7 @@ class IncrementalAppendScan(BaseScan):
         return self.update(to_snapshot_id=to_snapshot_id)
 
     def projection(self) -> Schema:
-        current_schema = self.table_metadata.schema()
-        if "*" in self.selected_fields:
-            return current_schema
-        return current_schema.select(*self.selected_fields, case_sensitive=self.case_sensitive)
+        return project_schema(self.table_metadata.schema(), self.selected_fields, case_sensitive=self.case_sensitive)
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plans the relevant files added between the specified snapshots."""
@@ -2827,10 +2985,8 @@ class ManifestGroupPlanner:
             data_file = manifest_entry.data_file
             if data_file.content == DataFileContent.DATA:
                 data_entries.append(manifest_entry)
-            elif data_file.content == DataFileContent.POSITION_DELETES:
+            elif data_file.content in (DataFileContent.POSITION_DELETES, DataFileContent.EQUALITY_DELETES):
                 delete_index.add_delete_file(manifest_entry, partition_key=data_file.partition)
-            elif data_file.content == DataFileContent.EQUALITY_DELETES:
-                raise ValueError("PyIceberg does not yet support equality deletes: https://github.com/apache/iceberg/issues/6568")
             else:
                 raise ValueError(f"Unknown DataFileContent ({data_file.content}): {manifest_entry}")
 
@@ -2845,6 +3001,7 @@ class ManifestGroupPlanner:
                 residual=residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
                     data_entry.data_file.partition
                 ),
+                sequence_number=data_entry.sequence_number,
             )
             for data_entry in data_entries
         ]

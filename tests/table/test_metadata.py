@@ -186,12 +186,30 @@ def test_serialize_v2(example_table_metadata_v2: dict[str, Any]) -> None:
 
 
 def test_serialize_v3(example_table_metadata_v3: dict[str, Any]) -> None:
-    # Writing will be part of https://github.com/apache/iceberg-python/issues/1551
+    table_metadata = TableMetadataV3(**example_table_metadata_v3)
+    serialized = json.loads(table_metadata.model_dump_json())
 
-    with pytest.raises(NotImplementedError) as exc_info:
-        _ = TableMetadataV3(**example_table_metadata_v3).model_dump_json()
+    assert serialized["format-version"] == 3
+    assert serialized["next-row-id"] == 1
+    # Empty encryption keys are left out
+    assert "encryption-keys" not in serialized
+    assert TableMetadataV3(**serialized) == table_metadata
 
-    assert "Writing V3 is not yet supported, see: https://github.com/apache/iceberg-python/issues/1551" in str(exc_info.value)
+
+def test_serialize_v3_with_encryption_keys(example_table_metadata_v3: dict[str, Any]) -> None:
+    encryption_keys = [{"key-id": "key-1", "encrypted-key-metadata": "c2VjcmV0", "encrypted-by-id": "kms-key", "properties": {}}]
+    table_metadata = TableMetadataV3(**{**example_table_metadata_v3, "encryption-keys": encryption_keys})
+    serialized = json.loads(table_metadata.model_dump_json())
+
+    assert serialized["encryption-keys"] == encryption_keys
+    assert TableMetadataV3(**serialized) == table_metadata
+
+
+def test_parse_v3_without_next_row_id(example_table_metadata_v3: dict[str, Any]) -> None:
+    # Defaulting to 0 could hand out row IDs that are already assigned, so the spec-required key must be present
+    metadata = {key: value for key, value in example_table_metadata_v3.items() if key != "next-row-id"}
+    with pytest.raises((ValidationError, PydanticValidationError), match="next-row-id"):
+        TableMetadataV3(**metadata)
 
 
 def test_migrate_v1_schemas(example_table_metadata_v1: dict[str, Any]) -> None:
@@ -839,12 +857,27 @@ def test_new_table_metadata_with_v3_schema() -> None:
         default_sort_order_id=1,
         refs={},
         format_version=3,
+        next_row_id=0,
     )
 
     assert actual.model_dump() == expected.model_dump()
     assert actual.schemas == [expected_schema]
     assert actual.partition_specs == [expected_spec]
     assert actual.sort_orders == [expected_sort_order]
+
+
+def test_new_table_metadata_v3_initializes_next_row_id() -> None:
+    actual = new_table_metadata(
+        schema=Schema(NestedField(field_id=1, name="foo", field_type=StringType(), required=False)),
+        partition_spec=PartitionSpec(),
+        sort_order=SortOrder(),
+        location="s3://some_v3_location/",
+        properties={"format-version": "3"},
+    )
+
+    assert actual.format_version == 3
+    assert actual.next_row_id == 0
+    assert json.loads(actual.model_dump_json())["next-row-id"] == 0
 
 
 @pytest.mark.parametrize(

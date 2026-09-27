@@ -49,8 +49,22 @@ from pyiceberg.table.update import (
     UpdatesAndRequirements,
     UpdateTableMetadata,
 )
+from pyiceberg.transforms import DayTransform, MonthTransform, VoidTransform, YearTransform
 from pyiceberg.typedef import L, TableVersion
-from pyiceberg.types import IcebergType, ListType, MapType, NestedField, PrimitiveType, StructType
+from pyiceberg.types import (
+    DateType,
+    GeographyType,
+    GeometryType,
+    IcebergType,
+    ListType,
+    MapType,
+    NestedField,
+    PrimitiveType,
+    StructType,
+    TimestampNanoType,
+    TimestampType,
+    UnknownType,
+)
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -144,12 +158,23 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         return self
 
     def union_by_name(
-        # TODO: Move TableProperties.DEFAULT_FORMAT_VERSION to separate file and set that as format_version default.
         self,
         new_schema: Schema | pa.Schema,
-        format_version: TableVersion = 2,
+        format_version: TableVersion | None = None,
     ) -> UpdateSchema:
+        """Merge a new schema into the current schema by matching fields by name.
+
+        Args:
+            new_schema: The schema to merge in.
+            format_version: Format version used to convert a PyArrow schema; defaults to the table's format version.
+
+        Returns:
+            This for method chaining.
+        """
         from pyiceberg.catalog import Catalog
+
+        if format_version is None:
+            format_version = self._transaction.table_metadata.format_version
 
         visit_with_partner(
             Catalog._convert_schema_if_needed(new_schema, format_version=format_version),
@@ -181,7 +206,8 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
             field_type: Type for the new column.
             doc: Documentation string for the new column.
             required: Whether the new column is required.
-            default_value: Default value for the new column.
+            default_value: Default value for the new column. Requires format version 3, unless incompatible
+                changes are allowed.
 
         Returns:
             This for method chaining.
@@ -224,6 +250,9 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         new_id = self.assign_new_column_id()
         new_type = assign_fresh_schema_ids(field_type, self.assign_new_column_id)
 
+        if default_value is not None and isinstance(new_type, (GeometryType, GeographyType, UnknownType)):
+            raise ValueError(f"Invalid default value: columns of type {new_type} must default to null: {full_name}")
+
         if default_value is not None:
             try:
                 # To make sure that the value is valid for the type
@@ -232,6 +261,13 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
                 raise ValueError(f"Invalid default value: {e}") from e
         else:
             initial_default = default_value  # type: ignore
+
+        format_version = self._transaction.table_metadata.format_version
+        if initial_default is not None and format_version < 3 and not self._allow_incompatible_changes:
+            raise ValueError(
+                f"Incompatible change: default values require format version 3 or higher, "
+                f"current format version is {format_version}: {full_name}"
+            )
 
         if (required and initial_default is None) and not self._allow_incompatible_changes:
             # Table format version 1 and 2 cannot add required column because there is no initial value
@@ -398,6 +434,16 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
 
         field = self._schema.find_field(name, self._case_sensitive)
 
+        if default_value is not None and isinstance(field.field_type, (GeometryType, GeographyType, UnknownType)):
+            raise ValueError(f"Invalid default value: columns of type {field.field_type} must default to null: {name}")
+
+        format_version = self._transaction.table_metadata.format_version
+        if default_value is not None and format_version < 3 and not self._allow_incompatible_changes:
+            raise ValueError(
+                f"Incompatible change: default values require format version 3 or higher, "
+                f"current format version is {format_version}: {name}"
+            )
+
         if default_value is not None:
             try:
                 # To make sure that the value is valid for the type
@@ -470,10 +516,14 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
                 raise ValidationError(f"Cannot change column type: {field.field_type} is not a primitive")
 
             if not self._allow_incompatible_changes and field.field_type != field_type:
+                if isinstance(field_type, (GeometryType, GeographyType)):
+                    # promote() accepts binary -> geometry/geography only to resolve file schemas on read
+                    raise ValidationError(f"Cannot change column type: {full_name}: {field.field_type} -> {field_type}")
                 try:
                     promote(field.field_type, field_type)
                 except ResolveError as e:
                     raise ValidationError(f"Cannot change column type: {full_name}: {field.field_type} -> {field_type}") from e
+                self._validate_v3_promotion(full_name, field, field_type)
 
         # if other updates for the same field exist in one transaction:
         if updated := self._updates.get(field.field_id):
@@ -501,6 +551,32 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
             self._set_column_requirement(path, required=required)
 
         return self
+
+    def _validate_v3_promotion(self, full_name: str, field: NestedField, field_type: IcebergType) -> None:
+        """Validate the type promotions that the spec only allows from format version 3."""
+        is_unknown_promotion = isinstance(field.field_type, UnknownType)
+        is_date_promotion = isinstance(field.field_type, DateType) and isinstance(field_type, (TimestampType, TimestampNanoType))
+        if not (is_unknown_promotion or is_date_promotion):
+            return
+
+        format_version = self._transaction.table_metadata.format_version
+        if format_version < 3:
+            raise ValidationError(
+                f"Cannot change column type: {full_name}: {field.field_type} -> {field_type} "
+                f"requires format version 3 or higher, current format version is {format_version}"
+            )
+
+        if is_date_promotion:
+            # Only allowed when every partition transform on the column produces the same value for the new type
+            for spec in self._transaction.table_metadata.partition_specs:
+                for partition_field in spec.fields:
+                    if partition_field.source_id == field.field_id and not isinstance(
+                        partition_field.transform, (YearTransform, MonthTransform, DayTransform, VoidTransform)
+                    ):
+                        raise ValidationError(
+                            f"Cannot change column type: {full_name}: {field.field_type} -> {field_type}, "
+                            f"the column is partitioned by {partition_field.transform}"
+                        )
 
     def _find_for_move(self, name: str) -> int | None:
         try:

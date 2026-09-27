@@ -29,7 +29,7 @@ from pydantic import Field, field_validator, model_serializer, model_validator
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table.metadata import SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata, TableMetadataUtil
+from pyiceberg.table.metadata import INITIAL_ROW_ID, SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata, TableMetadataUtil
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     MetadataLogEntry,
@@ -321,10 +321,15 @@ def _(
     elif update.format_version == base_metadata.format_version:
         return base_metadata
 
-    updated_metadata = base_metadata.model_copy(update={"format_version": update.format_version})
+    updated_metadata = TableMetadataUtil._construct_without_validation(
+        base_metadata.model_copy(update={"format_version": update.format_version})
+    )
+    if update.format_version >= 3 and base_metadata.format_version < 3:
+        # Rows in snapshots committed before the upgrade have no row ids, so row id assignment starts at 0
+        updated_metadata = updated_metadata.model_copy(update={"next_row_id": INITIAL_ROW_ID})
 
     context.add_update(update)
-    return TableMetadataUtil._construct_without_validation(updated_metadata)
+    return updated_metadata
 
 
 @_apply_table_update.register(SetPropertiesUpdate)
@@ -354,6 +359,8 @@ def _(update: RemovePropertiesUpdate, base_metadata: TableMetadata, context: _Ta
 
 @_apply_table_update.register(AddSchemaUpdate)
 def _(update: AddSchemaUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    update.schema_.check_format_version_compatibility(base_metadata.format_version)
+
     metadata_updates: dict[str, Any] = {
         "last_column_id": max(base_metadata.last_column_id, update.schema_.highest_field_id),
         "schemas": base_metadata.schemas + [update.schema_],
@@ -435,7 +442,7 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
     elif base_metadata.snapshot_by_id(update.snapshot.snapshot_id) is not None:
         raise ValueError(f"Snapshot with id {update.snapshot.snapshot_id} already exists")
     elif (
-        base_metadata.format_version == 2
+        base_metadata.format_version >= 2
         and update.snapshot.sequence_number is not None
         and update.snapshot.sequence_number <= base_metadata.last_sequence_number
         and update.snapshot.parent_snapshot_id is not None
@@ -444,32 +451,27 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
             f"Cannot add snapshot with sequence number {update.snapshot.sequence_number} "
             f"older than last sequence number {base_metadata.last_sequence_number}"
         )
-    elif base_metadata.format_version >= 3 and update.snapshot.first_row_id is None:
-        raise ValueError("Cannot add snapshot without first row id")
-    elif (
-        base_metadata.format_version >= 3
-        and update.snapshot.first_row_id is not None
-        and base_metadata.next_row_id is not None
-        and update.snapshot.first_row_id < base_metadata.next_row_id
-    ):
-        raise ValueError(
-            f"Cannot add a snapshot with first row id smaller than the table's next-row-id "
-            f"{update.snapshot.first_row_id} < {base_metadata.next_row_id}"
-        )
+
+    metadata_updates: dict[str, Any] = {
+        "last_updated_ms": update.snapshot.timestamp_ms,
+        "last_sequence_number": update.snapshot.sequence_number,
+        "snapshots": base_metadata.snapshots + [update.snapshot],
+    }
+
+    if base_metadata.format_version >= 3:
+        if update.snapshot.first_row_id is None:
+            raise ValueError("Cannot add snapshot without first row id")
+        if update.snapshot.first_row_id < base_metadata.next_row_id:
+            raise ValueError(
+                f"Cannot add a snapshot with first row id smaller than the table's next-row-id "
+                f"{update.snapshot.first_row_id} < {base_metadata.next_row_id}"
+            )
+        if update.snapshot.added_rows is None:
+            raise ValueError("Cannot add snapshot without added rows")
+        metadata_updates["next_row_id"] = base_metadata.next_row_id + update.snapshot.added_rows
 
     context.add_update(update)
-    return base_metadata.model_copy(
-        update={
-            "last_updated_ms": update.snapshot.timestamp_ms,
-            "last_sequence_number": update.snapshot.sequence_number,
-            "snapshots": base_metadata.snapshots + [update.snapshot],
-            "next_row_id": base_metadata.next_row_id + update.snapshot.added_rows
-            if base_metadata.format_version >= 3
-            and base_metadata.next_row_id is not None
-            and update.snapshot.added_rows is not None
-            else None,
-        }
-    )
+    return base_metadata.model_copy(update=metadata_updates)
 
 
 @_apply_table_update.register(SetSnapshotRefUpdate)

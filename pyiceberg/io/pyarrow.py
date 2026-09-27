@@ -30,7 +30,9 @@ import fnmatch
 import functools
 import importlib
 import itertools
+import json
 import logging
+import math
 import operator
 import os
 import re
@@ -147,14 +149,17 @@ from pyiceberg.schema import (
     visit_with_partner,
 )
 from pyiceberg.table import DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE, TableProperties
-from pyiceberg.table.deletion_vector import deletion_vectors_from_puffin_file
+from pyiceberg.table.delete_file import DeleteFileSet
+from pyiceberg.table.deletion_vector import read_deletion_vectors
 from pyiceberg.table.locations import load_location_provider
 from pyiceberg.table.metadata import TableMetadata
+from pyiceberg.table.metadata_columns import LAST_UPDATED_SEQUENCE_NUMBER, ROW_ID, schema_with_row_lineage
 from pyiceberg.table.name_mapping import NameMapping, apply_name_mapping
-from pyiceberg.table.puffin import PuffinFile
 from pyiceberg.transforms import IdentityTransform, TruncateTransform
 from pyiceberg.typedef import EMPTY_DICT, Properties, Record, TableVersion
 from pyiceberg.types import (
+    DEFAULT_GEOMETRY_CRS,
+    GEOGRAPHY_ALGORITHMS,
     BinaryType,
     BooleanType,
     DateType,
@@ -180,12 +185,14 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
     strtobool,
 )
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.config import Config
 from pyiceberg.utils.datetime import millis_to_datetime
 from pyiceberg.utils.decimal import unscaled_to_decimal
+from pyiceberg.utils.geo import geo_bounds_from_bbox
 from pyiceberg.utils.properties import get_first_property_value, property_as_bool, property_as_int
 from pyiceberg.utils.singleton import Singleton
 from pyiceberg.utils.truncate import truncate_upper_bound_binary_string, truncate_upper_bound_text_string
@@ -828,6 +835,10 @@ class _ConvertToArrowSchema(SchemaVisitorPerPrimitiveType[pa.DataType]):
     def visit_binary(self, _: BinaryType) -> pa.DataType:
         return pa.large_binary()
 
+    def visit_variant(self, _: VariantType) -> pa.DataType:
+        """Convert variant type to the struct that PyArrow reads an unshredded Parquet VARIANT group as."""
+        return _VARIANT_ARROW_TYPE
+
     def visit_geometry(self, geometry_type: GeometryType) -> pa.DataType:
         """Convert geometry type to PyArrow type.
 
@@ -851,13 +862,64 @@ class _ConvertToArrowSchema(SchemaVisitorPerPrimitiveType[pa.DataType]):
             import geoarrow.pyarrow as ga
 
             wkb_type = ga.wkb().with_crs(geography_type.crs)
-            # Map Iceberg algorithm to GeoArrow edge type
-            if geography_type.algorithm == "spherical":
-                wkb_type = wkb_type.with_edge_type(ga.EdgeType.SPHERICAL)
+            # Map the Iceberg edge-interpolation algorithm to the GeoArrow edge type of the same name
+            if geography_type.algorithm in GEOGRAPHY_ALGORITHMS:
+                wkb_type = wkb_type.with_edge_type(ga.EdgeType[geography_type.algorithm.upper()])
             # "planar" is the default edge type in GeoArrow, no need to set explicitly
             return wkb_type
         except ImportError:
             return pa.large_binary()
+
+
+GEOARROW_WKB_EXTENSION_NAME = "geoarrow.wkb"
+
+
+def _geoarrow_available() -> bool:
+    """Return whether geoarrow-pyarrow is installed."""
+    try:
+        import geoarrow.pyarrow  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _geoarrow_crs_to_iceberg(crs: Any) -> str:
+    """Convert the CRS of a GeoArrow extension type to an Iceberg CRS string."""
+    if crs is None:
+        return DEFAULT_GEOMETRY_CRS
+    if isinstance(crs, str):
+        return crs
+    if isinstance(crs, dict) and isinstance(crs_id := crs.get("id"), dict) and "authority" in crs_id and "code" in crs_id:
+        # PROJJSON, e.g. {"id": {"authority": "EPSG", "code": 3857}}
+        return f"{crs_id['authority']}:{crs_id['code']}"
+    raise TypeError(f"Unsupported GeoArrow CRS, expected a string or PROJJSON with an id: {crs}")
+
+
+def _geoarrow_wkb_to_iceberg(extension_type: pa.ExtensionType) -> PrimitiveType:
+    """Convert a GeoArrow WKB extension type to an Iceberg geometry or geography type.
+
+    The extension metadata is JSON with an optional `crs` and `edges`; planar edges (the default) map to a
+    geometry, any other edge type to a geography with the algorithm of the same name.
+    """
+    serialized = extension_type.__arrow_ext_serialize__()
+    metadata = json.loads(serialized) if serialized else {}
+    crs = _geoarrow_crs_to_iceberg(metadata.get("crs"))
+    edges = metadata.get("edges")
+    if edges is None or edges == "planar":
+        return GeometryType(crs)
+    if edges in GEOGRAPHY_ALGORITHMS:
+        return GeographyType(crs, edges)
+    raise TypeError(f"Unsupported GeoArrow edge type: {edges}")
+
+
+def _cast_to_geo(values: pa.Array, target_type: pa.DataType) -> pa.Array:
+    """Cast WKB values (binary, large_binary or a WKB extension array) to the Arrow type of a geo field."""
+    if isinstance(values.type, pa.ExtensionType):
+        values = values.storage
+    if isinstance(target_type, pa.ExtensionType):
+        return pa.ExtensionArray.from_storage(target_type, values.cast(target_type.storage_type))
+    return values.cast(target_type)
 
 
 def _convert_scalar(value: Any, iceberg_type: IcebergType) -> pa.scalar:
@@ -1155,10 +1217,7 @@ def _read_deletes(io: FileIO, data_file: DataFile) -> dict[str, pa.ChunkedArray]
                 for path in table.column("file_path").unique()
             }
     elif data_file.file_format == FileFormat.PUFFIN:
-        with io.new_input(data_file.file_path).open() as fi:
-            payload = fi.read()
-
-        return {dv.referenced_data_file: dv.to_vector() for dv in deletion_vectors_from_puffin_file(PuffinFile(payload))}
+        return {dv.referenced_data_file: dv.to_vector() for dv in read_deletion_vectors(io, data_file)}
     else:
         raise ValueError(f"Delete file format not supported: {data_file.file_format}")
 
@@ -1240,14 +1299,50 @@ def visit_pyarrow(obj: pa.DataType | pa.Schema, visitor: PyArrowSchemaVisitor[T]
 
 @visit_pyarrow.register(pa.Schema)
 def _(obj: pa.Schema, visitor: PyArrowSchemaVisitor[T]) -> T:
-    return visitor.schema(obj, visit_pyarrow(pa.struct(obj), visitor))
+    # The root is always a struct, even when its columns are named like the fields of a variant
+    struct = pa.struct(obj)
+    return visitor.schema(obj, visitor.struct(struct, [visit_pyarrow(field, visitor) for field in struct]))
 
 
 @visit_pyarrow.register(pa.StructType)
 def _(obj: pa.StructType, visitor: PyArrowSchemaVisitor[T]) -> T:
+    if _is_variant_group(obj):
+        return visitor.variant(obj)
+
     results = [visit_pyarrow(field, visitor) for field in obj]
 
     return visitor.struct(obj, results)
+
+
+_VARIANT_METADATA = "metadata"
+_VARIANT_VALUE = "value"
+_VARIANT_TYPED_VALUE = "typed_value"
+_VARIANT_ARROW_TYPE = pa.struct(
+    [
+        pa.field(_VARIANT_METADATA, pa.binary(), nullable=False),
+        pa.field(_VARIANT_VALUE, pa.binary(), nullable=False),
+    ]
+)
+
+
+def _is_binary_like(arrow_type: pa.DataType) -> bool:
+    return pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type) or pa.types.is_binary_view(arrow_type)
+
+
+def _is_variant_group(struct: pa.StructType) -> bool:
+    """Return whether a struct is a Parquet VARIANT group, unshredded or shredded.
+
+    The spec forbids field ids on the ``metadata``, ``value`` and ``typed_value`` fields of a variant, while
+    every Iceberg struct field carries one, which tells the two apart.
+    """
+    names = {field.name for field in struct}
+    if _VARIANT_METADATA not in names or not names <= {_VARIANT_METADATA, _VARIANT_VALUE, _VARIANT_TYPED_VALUE}:
+        return False
+    if names == {_VARIANT_METADATA}:
+        return False
+    if any(_get_field_id(field) is not None for field in struct):
+        return False
+    return all(_is_binary_like(field.type) for field in struct if field.name != _VARIANT_TYPED_VALUE)
 
 
 @visit_pyarrow.register(pa.ListType)
@@ -1307,6 +1402,10 @@ def _(obj: pa.DataType, visitor: PyArrowSchemaVisitor[T]) -> T:
 class PyArrowSchemaVisitor(Generic[T], ABC):
     def before_field(self, field: pa.Field) -> None:
         """Override this method to perform an action immediately before visiting a field."""
+
+    def variant(self, variant_group: pa.StructType) -> T:
+        """Visit a Parquet VARIANT group, which is a plain struct unless a visitor overrides this."""
+        return self.struct(variant_group, [visit_pyarrow(field, self) for field in variant_group])
 
     def after_field(self, field: pa.Field) -> None:
         """Override this method to perform an action immediately after visiting a field."""
@@ -1372,6 +1471,10 @@ class _HasIds(PyArrowSchemaVisitor[bool]):
     def schema(self, schema: pa.Schema, struct_result: bool) -> bool:
         return struct_result
 
+    def variant(self, variant_group: pa.StructType) -> bool:
+        # The fields of a variant never carry field ids
+        return True
+
     def struct(self, struct: pa.StructType, field_results: builtins.list[bool]) -> bool:
         return all(field_results)
 
@@ -1418,11 +1521,16 @@ class _ConvertToIceberg(PyArrowSchemaVisitor[IcebergType | Schema]):
     def struct(self, struct: pa.StructType, field_results: builtins.list[NestedField]) -> StructType:
         return StructType(*field_results)
 
+    def variant(self, variant_group: pa.StructType) -> IcebergType | Schema:
+        return VariantType()
+
     def field(self, field: pa.Field, field_result: IcebergType) -> NestedField:
         field_id = self._field_id(field)
         field_doc = doc_str.decode() if (field.metadata and (doc_str := field.metadata.get(PYARROW_FIELD_DOC_KEY))) else None
         field_type = field_result
-        return NestedField(field_id, field.name, field_type, required=not field.nullable, doc=field_doc)
+        # A column of type unknown is always optional
+        required = not field.nullable and not isinstance(field_type, UnknownType)
+        return NestedField(field_id, field.name, field_type, required=required, doc=field_doc)
 
     def list(self, list_type: pa.ListType, element_result: IcebergType) -> ListType:
         element_field = list_type.value_field
@@ -1443,7 +1551,10 @@ class _ConvertToIceberg(PyArrowSchemaVisitor[IcebergType | Schema]):
         return MapType(key_id, key_result, value_id, value_result, value_required=not value_field.nullable)
 
     def primitive(self, primitive: pa.DataType) -> PrimitiveType:
-        if pa.types.is_boolean(primitive):
+        if isinstance(primitive, pa.ExtensionType) and primitive.extension_name == GEOARROW_WKB_EXTENSION_NAME:
+            # Only produced when geoarrow-pyarrow has registered the extension type
+            return _geoarrow_wkb_to_iceberg(primitive)
+        elif pa.types.is_boolean(primitive):
             return BooleanType()
         elif pa.types.is_integer(primitive):
             width = primitive.bit_width
@@ -1605,6 +1716,10 @@ class _ConvertToIcebergWithoutIDs(_ConvertToIceberg):
     def _field_id(self, field: pa.Field) -> int:
         return -1
 
+    def variant(self, variant_group: pa.StructType) -> IcebergType | Schema:
+        # Without field ids a variant cannot be told apart from a struct with metadata and value fields
+        return PyArrowSchemaVisitor.variant(self, variant_group)
+
 
 def _get_column_projection_values(
     file: DataFile,
@@ -1632,6 +1747,178 @@ def _get_column_projection_values(
     return projected_missing_fields
 
 
+# Temporary column holding each row's position in the data file while filters are applied
+_ROW_POSITION_COLUMN = "__pyiceberg_row_position"
+
+
+@dataclass(frozen=True)
+class _EqualityDeletes:
+    """The rows of one equality delete file, projected onto its delete columns.
+
+    Attributes:
+        field_ids: The field ids of the delete columns (the file's ``equality_ids``).
+        rows: The delete rows, with one column per delete column named after its field id.
+    """
+
+    field_ids: tuple[int, ...]
+    rows: pa.Table
+
+
+def _field_path(schema: Schema, field_id: int) -> list[str] | None:
+    """Return the names from the root of the schema to the field, or None when the field is not in the schema."""
+    if field_id not in schema._lazy_id_to_field:
+        return None
+    parents = schema._lazy_id_to_parent
+    names = [schema.find_field(field_id).name]
+    parent_id = parents.get(field_id)
+    while parent_id is not None:
+        names.append(schema.find_field(parent_id).name)
+        parent_id = parents.get(parent_id)
+    return list(reversed(names))
+
+
+def _column_by_path(data: pa.RecordBatch | pa.Table, path: list[str]) -> pa.Array | pa.ChunkedArray:
+    """Return a (possibly nested) column; a null parent struct yields a null value."""
+    column = data.column(path[0])
+    for name in path[1:]:
+        column = pc.struct_field(column, name)
+    return column
+
+
+def _read_equality_deletes(
+    io: FileIO,
+    delete_file: DataFile,
+    name_mapping: NameMapping | None = None,
+    format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
+) -> _EqualityDeletes:
+    """Read the delete columns of an equality delete file, matching them to the table by field id.
+
+    Other columns stored in the delete file are ignored.
+    """
+    if not delete_file.equality_ids:
+        raise ValueError(f"Equality delete file has no equality_ids: {delete_file.file_path}")
+    if delete_file.file_format not in (FileFormat.PARQUET, FileFormat.ORC):
+        raise ValueError(f"Equality delete file format not supported: {delete_file.file_format}")
+
+    with io.new_input(delete_file.file_path).open() as fi:
+        fragment = _get_file_format(delete_file.file_format).make_fragment(fi)
+        file_schema = pyarrow_to_schema(
+            fragment.physical_schema,
+            name_mapping,
+            downcast_ns_timestamp_to_us=format_version <= 2,
+            format_version=format_version,
+        )
+        paths: dict[int, list[str]] = {}
+        for field_id in delete_file.equality_ids:
+            path = _field_path(file_schema, field_id)
+            if path is None:
+                raise ValueError(f"Equality delete file {delete_file.file_path} is missing the delete column with id {field_id}")
+            paths[field_id] = path
+        columns = list(dict.fromkeys(path[0] for path in paths.values()))
+        table = ds.Scanner.from_fragment(fragment=fragment, columns=columns).to_table()
+
+    rows = pa.table({str(field_id): _column_by_path(table, path) for field_id, path in paths.items()})
+    return _EqualityDeletes(field_ids=tuple(paths), rows=rows)
+
+
+def _normalize_key_array(array: pa.Array | pa.ChunkedArray) -> pa.Array:
+    """Return a plain array that Arrow compute kernels can compare."""
+    if isinstance(array, pa.ChunkedArray):
+        array = array.combine_chunks()
+    if isinstance(array, pa.DictionaryArray):
+        array = array.dictionary_decode()
+    if isinstance(array, pa.ExtensionArray):
+        array = array.storage
+    return array
+
+
+def _align_key_arrays(data: pa.Array, deletes: pa.Array) -> tuple[pa.Array, pa.Array]:
+    """Cast the data and delete values of one delete column to a common type."""
+    if data.type == deletes.type:
+        return data, deletes
+    try:
+        return data.cast(deletes.type), deletes
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        return data, deletes.cast(data.type)
+
+
+def _equality_delete_mask(data_keys: list[pa.Array], delete_keys: list[pa.Array | pa.ChunkedArray]) -> pa.Array:
+    """Return a mask that is true for each data row equal to any delete row on all delete columns.
+
+    Following the spec, a null value is equal to a null value.
+    """
+    num_rows = len(data_keys[0])
+    aligned = [
+        _align_key_arrays(_normalize_key_array(data), _normalize_key_array(deletes))
+        for data, deletes in zip(data_keys, delete_keys, strict=True)
+    ]
+
+    if len(aligned) == 1:
+        data, deletes = aligned[0]
+        # is_in matches a null input against a null in the value set
+        return pc.fill_null(pc.is_in(data, value_set=deletes), False)
+
+    # A hash join never matches null keys, so each column is joined on a null flag plus its value with nulls filled
+    left: dict[str, pa.Array] = {"__pos": pa.array(range(num_rows), type=pa.int64())}
+    right: dict[str, pa.Array] = {}
+    keys: list[str] = []
+    for index, (data, deletes) in enumerate(aligned):
+        keys.append(f"null_{index}")
+        left[keys[-1]] = pc.is_null(data)
+        right[keys[-1]] = pc.is_null(deletes)
+        non_null = pc.drop_null(data) if data.null_count < len(data) else pc.drop_null(deletes)
+        if len(non_null) > 0:
+            keys.append(f"value_{index}")
+            left[keys[-1]] = pc.fill_null(data, non_null[0])
+            right[keys[-1]] = pc.fill_null(deletes, non_null[0])
+
+    delete_table = pa.table(right).group_by(keys).aggregate([])
+    matched = pa.table(left).join(delete_table, keys=keys, join_type="left semi")
+    return pc.is_in(left["__pos"], value_set=matched.column("__pos"))
+
+
+def _equality_key_arrays(
+    batch: pa.RecordBatch,
+    deletes: _EqualityDeletes,
+    data_paths: dict[int, list[str] | None],
+    missing_values: dict[int, Any],
+) -> list[pa.Array]:
+    """Return the values of the delete columns for the rows of a data batch."""
+    keys: list[pa.Array] = []
+    for field_id in deletes.field_ids:
+        path = data_paths.get(field_id)
+        if path is not None:
+            keys.append(_column_by_path(batch, path))
+        else:
+            # A delete column that the data file does not contain takes its projected value, or null
+            delete_type = deletes.rows.column(str(field_id)).type
+            value = missing_values.get(field_id)
+            keys.append(
+                pa.nulls(batch.num_rows, delete_type)
+                if value is None
+                else pa.repeat(pa.scalar(value, delete_type), batch.num_rows)
+            )
+    return keys
+
+
+def _equality_missing_values(
+    task: FileScanTask, table_schema: Schema, partition_spec: PartitionSpec | None, field_ids: set[int]
+) -> dict[int, Any]:
+    """Return the projected values of delete columns that a data file does not contain."""
+    if not field_ids:
+        return EMPTY_DICT
+    values = dict(
+        _get_column_projection_values(
+            task.file, prune_columns(table_schema, field_ids, select_full_types=False), table_schema, partition_spec, set()
+        )
+    )
+    for field_id in field_ids:
+        field = table_schema._lazy_id_to_field.get(field_id)
+        if field_id not in values and field is not None and field.initial_default is not None:
+            values[field_id] = field.initial_default
+    return {field_id: value for field_id, value in values.items() if field_id in field_ids}
+
+
 def _task_to_record_batches(
     io: FileIO,
     task: FileScanTask,
@@ -1646,6 +1933,7 @@ def _task_to_record_batches(
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
     downcast_ns_timestamp_to_us: bool | None = None,
     dictionary_columns: tuple[str, ...] = (),
+    equality_deletes: list[_EqualityDeletes] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     format_kwargs: dict[str, Any] = {"pre_buffer": True, "buffer_size": ONE_MEGABYTE * 8}
     if dictionary_columns and task.file.file_format == FileFormat.PARQUET:
@@ -1678,14 +1966,24 @@ def _task_to_record_batches(
             bound_file_filter = bind(file_schema, translated_row_filter, case_sensitive=case_sensitive)
             pyarrow_filter = expression_to_pyarrow(bound_file_filter, file_schema)
 
-        file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
+        # Equality deletes compare the delete columns, so they are read even when not projected
+        equality_field_ids = {field_id for deletes in equality_deletes or () for field_id in deletes.field_ids}
+        file_project_schema = prune_columns(file_schema, projected_field_ids | equality_field_ids, select_full_types=False)
+        equality_paths = {field_id: _field_path(file_schema, field_id) for field_id in equality_field_ids}
+        equality_missing_values = _equality_missing_values(
+            task, table_schema, partition_spec, {field_id for field_id, path in equality_paths.items() if path is None}
+        )
+
+        # Row lineage columns are derived from the position of each row in the file
+        track_positions = ROW_ID.field_id in projected_schema.field_ids
+        apply_filter_after_read = bool(positional_deletes) or track_positions
 
         fragment_scanner = ds.Scanner.from_fragment(
             fragment=fragment,
             schema=physical_schema,
             # This will push down the query to Arrow.
-            # But in case there are positional deletes, we have to apply them first
-            filter=pyarrow_filter if not positional_deletes else None,
+            # But in case there are positional deletes or row positions are needed, we have to apply them first
+            filter=pyarrow_filter if not apply_filter_after_read else None,
             columns=[col.name for col in file_project_schema.columns],
         )
 
@@ -1695,27 +1993,50 @@ def _task_to_record_batches(
             next_index = next_index + len(batch)
             current_index = next_index - len(batch)
             current_batch = batch
+            positions = _row_positions(current_index, next_index) if track_positions else None
 
             if positional_deletes:
                 # Create the mask of indices that we're interested in
                 indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
                 current_batch = current_batch.take(indices)
-                if pyarrow_filter is not None:
-                    # Temporary fix until PyArrow 21 is the minimum supported version
-                    # (https://github.com/apache/arrow/pull/46057): RecordBatch.filter raises
-                    # IndexError on PyArrow <21 when the result is empty; Table.filter does not.
-                    table = pa.Table.from_batches([current_batch])
-                    table = table.filter(pyarrow_filter)
-                    if table.num_rows == 0:
-                        current_batch = current_batch.slice(0, 0)
-                    else:
-                        current_batch = table.combine_chunks().to_batches()[0]
+                if positions is not None:
+                    positions = positions.take(indices)
+
+            if equality_deletes and current_batch.num_rows > 0:
+                # Equality deletes apply after positional deletes, so positions still refer to the data file
+                deleted = None
+                for deletes in equality_deletes:
+                    data_keys = _equality_key_arrays(current_batch, deletes, equality_paths, equality_missing_values)
+                    delete_keys = [deletes.rows.column(str(field_id)) for field_id in deletes.field_ids]
+                    mask = _equality_delete_mask(data_keys, delete_keys)
+                    deleted = mask if deleted is None else pc.or_(deleted, mask)
+                if deleted is not None:
+                    indices = pc.indices_nonzero(pc.invert(deleted))
+                    current_batch = current_batch.take(indices)
+                    if positions is not None:
+                        positions = positions.take(indices)
+
+            if apply_filter_after_read and pyarrow_filter is not None:
+                if positions is not None:
+                    current_batch = current_batch.append_column(_ROW_POSITION_COLUMN, positions)
+                # Temporary fix until PyArrow 21 is the minimum supported version
+                # (https://github.com/apache/arrow/pull/46057): RecordBatch.filter raises
+                # IndexError on PyArrow <21 when the result is empty; Table.filter does not.
+                table = pa.Table.from_batches([current_batch])
+                table = table.filter(pyarrow_filter)
+                if table.num_rows == 0:
+                    current_batch = current_batch.slice(0, 0)
+                else:
+                    current_batch = table.combine_chunks().to_batches()[0]
+                if positions is not None:
+                    positions = current_batch.column(_ROW_POSITION_COLUMN)
+                    current_batch = current_batch.drop_columns([_ROW_POSITION_COLUMN])
 
             # skip empty batches
             if current_batch.num_rows == 0:
                 continue
 
-            yield _to_requested_schema(
+            result_batch = _to_requested_schema(
                 projected_schema,
                 file_project_schema,
                 current_batch,
@@ -1723,25 +2044,107 @@ def _task_to_record_batches(
                 projected_missing_fields=projected_missing_fields,
                 allow_timestamp_tz_mismatch=True,
             )
+            yield _inherit_row_lineage(result_batch, projected_schema, task, positions)
+
+
+def _row_positions(start: int, stop: int) -> pa.Array:
+    """Return the int64 positions ``start`` (inclusive) to ``stop`` (exclusive)."""
+    return pc.add(pc.cumulative_sum(pa.repeat(pa.scalar(1, pa.int64()), stop - start)), pa.scalar(start - 1, pa.int64()))
+
+
+def _inherit_row_lineage(
+    batch: pa.RecordBatch, projected_schema: Schema, task: FileScanTask, positions: pa.Array | None
+) -> pa.RecordBatch:
+    """Fill null row lineage metadata columns from the data file's first row ID and data sequence number.
+
+    Rows keep values that are stored in the data file. Files added before row lineage was enabled have no
+    first_row_id, and both columns stay null for them.
+    """
+    first_row_id = task.file.first_row_id
+    for index, field in enumerate(projected_schema.fields):
+        if field.field_id == ROW_ID.field_id:
+            inherited = (
+                None if first_row_id is None or positions is None else pc.add(positions, pa.scalar(first_row_id, pa.int64()))
+            )
+        elif field.field_id == LAST_UPDATED_SEQUENCE_NUMBER.field_id:
+            inherited = (
+                None
+                if first_row_id is None or task.sequence_number is None
+                else pa.repeat(pa.scalar(task.sequence_number, pa.int64()), batch.num_rows)
+            )
+        else:
+            continue
+
+        if inherited is not None:
+            column = batch.column(index)
+            values = inherited if column.null_count == len(column) else pc.coalesce(column, inherited)
+            batch = batch.set_column(index, batch.schema.field(index), values.cast(column.type))
+
+    return batch
 
 
 def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[str, list[ChunkedArray]]:
     deletes_per_file: dict[str, list[ChunkedArray]] = {}
-    unique_deletes = set(itertools.chain.from_iterable([task.delete_files for task in tasks]))
+    # A delete file can hold positions for several data files, but it only applies to the data files
+    # it was planned for (for example, a DV supersedes older position deletes for its data file)
+    planned_deletes: dict[str, DeleteFileSet] = {}
+    for task in tasks:
+        planned_deletes.setdefault(task.file.file_path, DeleteFileSet()).update(
+            delete_file for delete_file in task.delete_files if delete_file.content != DataFileContent.EQUALITY_DELETES
+        )
+    unique_deletes = DeleteFileSet(itertools.chain.from_iterable(planned_deletes.values()))
     if len(unique_deletes) > 0:
         executor = ExecutorFactory.get_or_create()
+        delete_files = list(unique_deletes)
         deletes_per_files: Iterator[dict[str, ChunkedArray]] = executor.map(
             lambda args: _read_deletes(*args),
-            [(io, delete_file) for delete_file in unique_deletes],
+            [(io, delete_file) for delete_file in delete_files],
         )
-        for delete in deletes_per_files:
+        for delete_file, delete in zip(delete_files, deletes_per_files, strict=True):
             for file, arr in delete.items():
+                if delete_file not in planned_deletes.get(file, ()):
+                    continue
                 if file in deletes_per_file:
                     deletes_per_file[file].append(arr)
                 else:
                     deletes_per_file[file] = [arr]
 
     return deletes_per_file
+
+
+def _read_all_equality_delete_files(
+    io: FileIO,
+    tasks: Iterable[FileScanTask],
+    name_mapping: NameMapping | None = None,
+    format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
+) -> dict[str, list[_EqualityDeletes]]:
+    """Read every equality delete file planned for the tasks once, and group them by data file path."""
+    planned_deletes: dict[str, DeleteFileSet] = {}
+    for task in tasks:
+        equality_deletes = [
+            delete_file for delete_file in task.delete_files if delete_file.content == DataFileContent.EQUALITY_DELETES
+        ]
+        if equality_deletes:
+            planned_deletes.setdefault(task.file.file_path, DeleteFileSet()).update(equality_deletes)
+
+    if not planned_deletes:
+        return {}
+
+    unique_deletes = list(DeleteFileSet(itertools.chain.from_iterable(planned_deletes.values())))
+    executor = ExecutorFactory.get_or_create()
+    read_deletes = dict(
+        zip(
+            (delete_file.file_path for delete_file in unique_deletes),
+            executor.map(
+                lambda delete_file: _read_equality_deletes(io, delete_file, name_mapping, format_version), unique_deletes
+            ),
+            strict=True,
+        )
+    )
+    return {
+        data_file_path: [read_deletes[delete_file.file_path] for delete_file in delete_files]
+        for data_file_path, delete_files in planned_deletes.items()
+    }
 
 
 class ArrowScan:
@@ -1847,7 +2250,11 @@ class ArrowScan:
             ResolveError: When a required field cannot be found in the file
             ValueError: When a field type in the file cannot be projected to the schema type
         """
+        tasks = list(tasks)
         deletes_per_file = _read_all_delete_files(self._io, tasks)
+        equality_deletes_per_file = _read_all_equality_delete_files(
+            self._io, tasks, self._table_metadata.name_mapping(), self._table_metadata.format_version
+        )
 
         total_row_count = 0
         executor = ExecutorFactory.get_or_create()
@@ -1856,7 +2263,7 @@ class ArrowScan:
             # Materialize the iterator here to ensure execution happens within the executor.
             # Otherwise, the iterator would be lazily consumed later (in the main thread),
             # defeating the purpose of using executor.map.
-            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file))
+            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file, equality_deletes_per_file))
 
         limit_reached = False
         for batches in executor.map(batches_for_task, tasks):
@@ -1876,7 +2283,10 @@ class ArrowScan:
                 break
 
     def _record_batches_from_scan_tasks_and_deletes(
-        self, tasks: Iterable[FileScanTask], deletes_per_file: dict[str, list[ChunkedArray]]
+        self,
+        tasks: Iterable[FileScanTask],
+        deletes_per_file: dict[str, list[ChunkedArray]],
+        equality_deletes_per_file: dict[str, list[_EqualityDeletes]] | None = None,
     ) -> Iterator[pa.RecordBatch]:
         total_row_count = 0
         for task in tasks:
@@ -1896,6 +2306,7 @@ class ArrowScan:
                 self._table_metadata.format_version,
                 self._downcast_ns_timestamp_to_us,
                 self._dictionary_columns,
+                equality_deletes=(equality_deletes_per_file or {}).get(task.file.file_path),
             )
             for batch in batches:
                 if self._limit is not None:
@@ -1916,6 +2327,7 @@ def _to_requested_schema(
     projected_missing_fields: dict[int, Any] = EMPTY_DICT,
     allow_timestamp_tz_mismatch: bool = False,
     format_model: FileFormatModel | None = None,
+    for_write: bool = False,
 ) -> pa.RecordBatch:
     # We could reuse some of these visitors
     struct_array = visit_with_partner(
@@ -1928,10 +2340,22 @@ def _to_requested_schema(
             projected_missing_fields=projected_missing_fields,
             allow_timestamp_tz_mismatch=allow_timestamp_tz_mismatch,
             format_model=format_model,
+            for_write=for_write,
         ),
         ArrowAccessor(file_schema),
     )
     return pa.RecordBatch.from_struct_array(struct_array)
+
+
+def _to_unshredded_variant(values: pa.Array) -> pa.Array:
+    """Return a variant column as a struct of its binary metadata and value."""
+    if not pa.types.is_struct(values.type) or not _is_binary_like(values.type.field(_VARIANT_METADATA).type):
+        raise ValueError(f"Unsupported schema projection from {values.type} to variant")
+    if values.type.get_field_index(_VARIANT_TYPED_VALUE) >= 0:
+        raise NotImplementedError("Reading shredded variant columns (with a typed_value field) is not yet supported")
+    if values.type.get_field_index(_VARIANT_VALUE) < 0:
+        raise ValueError(f"Unsupported schema projection from {values.type} to variant")
+    return values.cast(_VARIANT_ARROW_TYPE)
 
 
 class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]):
@@ -1941,6 +2365,7 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
     _projected_missing_fields: dict[int, Any]
     _allow_timestamp_tz_mismatch: bool
     _format_model: FileFormatModel | None
+    _for_write: bool
 
     def __init__(
         self,
@@ -1950,6 +2375,7 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
         projected_missing_fields: dict[int, Any] = EMPTY_DICT,
         allow_timestamp_tz_mismatch: bool = False,
         format_model: FileFormatModel | None = None,
+        for_write: bool = False,
     ) -> None:
         if include_field_ids and format_model is None:
             raise ValueError("format_model is required when include_field_ids=True")
@@ -1961,12 +2387,42 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
         # Allowed for reading (aligns with Spark); disallowed for writing to enforce Iceberg spec's strict typing.
         self._allow_timestamp_tz_mismatch = allow_timestamp_tz_mismatch
         self._format_model = format_model
+        # When True, the projection produces a batch for a data file: missing columns are filled from the
+        # write-default, unknown columns are dropped, and geo columns use a type the Parquet writer supports
+        self._for_write = for_write
+
+    def _arrow_type(self, field_type: IcebergType) -> pa.DataType:
+        """Return the Arrow type of a projected column."""
+        if self._for_write and isinstance(field_type, GeographyType) and field_type.algorithm != "spherical":
+            # The Parquet writer only supports spherical edges for the GEOGRAPHY logical type
+            warnings.warn(
+                f"Writing geography with the {field_type.algorithm} edge algorithm as plain WKB binary: "
+                "the Parquet GEOGRAPHY logical type is only written for spherical edges",
+                stacklevel=2,
+            )
+            return pa.large_binary()
+        if self._for_write and isinstance(field_type, (GeometryType, GeographyType)) and not _geoarrow_available():
+            warnings.warn(
+                "Writing geometry/geography as plain WKB binary; install pyiceberg[geoarrow] to write the Parquet "
+                "GEOMETRY/GEOGRAPHY logical types",
+                stacklevel=2,
+            )
+        return schema_to_pyarrow(field_type, include_field_ids=self._include_field_ids)
 
     def _cast_if_needed(self, field: NestedField, values: pa.Array) -> pa.Array:
         file_field = self._file_schema.find_field(field.field_id)
 
+        if isinstance(field.field_type, VariantType):
+            # The file schema of a variant may be a pruned struct, so the values are checked instead
+            return _to_unshredded_variant(values)
+
         if field.field_type.is_primitive:
-            if (target_type := schema_to_pyarrow(field.field_type, include_field_ids=self._include_field_ids)) != values.type:
+            if (target_type := self._arrow_type(field.field_type)) != values.type:
+                if isinstance(file_field.field_type, DateType) and isinstance(
+                    field.field_type, (TimestampType, TimestampNanoType)
+                ):
+                    # Format version 3 date -> timestamp promotion reads a date as midnight
+                    return values.cast(target_type)
                 if field.field_type == TimestampType():
                     source_tz_compatible = values.type.tz is None or (
                         self._allow_timestamp_tz_mismatch and values.type.tz in UTC_ALIASES
@@ -1996,6 +2452,16 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
                         elif target_type.unit == "us" and values.type.unit in {"s", "ms", "us"}:
                             return values.cast(target_type)
                     raise ValueError(f"Unsupported schema projection from {values.type} to {target_type}")
+                elif isinstance(field.field_type, (TimestampNanoType, TimestamptzNanoType)):
+                    # Files written with downcast-ns-timestamp-to-us-on-write store microseconds for nanosecond columns.
+                    # The Arrow type carries the unit, so upcasting is exact. This is deliberately not a promote() rule,
+                    # which would also allow timestamp -> timestamp_ns schema evolution and misread Avro longs.
+                    if (
+                        pa.types.is_timestamp(values.type)
+                        and values.type.unit in {"s", "ms", "us"}
+                        and (values.type.tz in UTC_ALIASES if target_type.tz else values.type.tz is None)
+                    ):
+                        return values.cast(target_type)
                 elif isinstance(field.field_type, (IntegerType, LongType)):
                     # Cast smaller integer types to target type for cross-platform compatibility
                     # Only allow widening conversions (smaller bit width to larger)
@@ -2014,6 +2480,12 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
                         target_width = target_type.bit_width
                         if source_width < target_width:
                             return values.cast(target_type)
+                elif isinstance(field.field_type, (GeometryType, GeographyType)):
+                    # Parquet GEOMETRY/GEOGRAPHY columns are read as WKB binary; attach the geo type of the table
+                    # schema (a GeoArrow extension type when geoarrow-pyarrow is installed, else large_binary)
+                    storage_type = values.type.storage_type if isinstance(values.type, pa.ExtensionType) else values.type
+                    if pa.types.is_binary(storage_type) or pa.types.is_large_binary(storage_type):
+                        return _cast_to_geo(values, target_type)
 
             if field.field_type != file_field.field_type:
                 target_schema = schema_to_pyarrow(
@@ -2048,20 +2520,25 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, pa.Array | None]
         field_arrays: list[pa.Array] = []
         fields: list[pa.Field] = []
         for field, field_array in zip(struct.fields, field_results, strict=True):
+            if self._for_write and isinstance(field.field_type, UnknownType):
+                # Columns of type unknown are always null and are not stored in data files
+                continue
+            # Writes fill missing columns from the write-default only, reads from the initial-default
+            default = field.write_default if self._for_write else field.initial_default
             if field_array is not None:
                 array = self._cast_if_needed(field, field_array)
                 field_arrays.append(array)
                 fields.append(self._construct_field(field, array.type))
-            elif field.optional or field.initial_default is not None:
-                # When an optional field is added, or when a required field with a non-null initial default is added
-                arrow_type = schema_to_pyarrow(field.field_type, include_field_ids=self._include_field_ids)
+            elif field.optional or default is not None:
+                # When an optional field is added, or when a required field with a non-null default is added
+                arrow_type = self._arrow_type(field.field_type)
                 projected_value = self._projected_missing_fields.get(field.field_id)
                 if projected_value is not None:
                     field_arrays.append(pa.repeat(pa.scalar(projected_value, type=arrow_type), len(struct_array)))
-                elif field.initial_default is None:
+                elif default is None:
                     field_arrays.append(pa.nulls(len(struct_array), type=arrow_type))
                 else:
-                    field_arrays.append(pa.repeat(pa.scalar(field.initial_default, type=arrow_type), len(struct_array)))
+                    field_arrays.append(pa.repeat(pa.scalar(default, type=arrow_type), len(struct_array)))
                 fields.append(self._construct_field(field, arrow_type))
             else:
                 raise ResolveError(f"Field is required, and could not be found in the file: {field}")
@@ -2219,6 +2696,10 @@ class PrimitiveToPhysicalType(SchemaVisitorPerPrimitiveType[str]):
     def visit_unknown(self, unknown_type: UnknownType) -> str:
         return "UNKNOWN"
 
+    def visit_variant(self, variant_type: VariantType) -> str:
+        # Unshredded metadata and value are both binary
+        return "BYTE_ARRAY"
+
     def visit_geometry(self, geometry_type: GeometryType) -> str:
         return "BYTE_ARRAY"
 
@@ -2302,6 +2783,81 @@ class StatsAggregator:
             if self.trunc_length is not None:
                 raise ValueError(f"{self.primitive_type} cannot be truncated")
             return self.serialize(self.current_max)
+
+
+class GeospatialStatsAggregator(StatsAggregator):
+    """Aggregates the Parquet geospatial statistics of a geometry or geography column into bounding-box bounds.
+
+    Parquet min/max statistics on WKB values are lexicographic and meaningless as geo bounds, so the bounds are
+    built from the bounding box in `ColumnChunkMetaData.geo_statistics` instead. Any row group without a bounding
+    box invalidates the bounds of the whole file.
+    """
+
+    _BOX_KEYS = ("xmin", "ymin", "zmin", "mmin", "xmax", "ymax", "zmax", "mmax")
+
+    def __init__(self, iceberg_type: PrimitiveType) -> None:
+        self.current_min = None
+        self.current_max = None
+        self.trunc_length = None
+        self.primitive_type = iceberg_type
+        self._box: dict[str, float | None] | None = None
+        self._valid = True
+
+    def update_box(self, geo_statistics: Any | None) -> None:
+        """Merge the bounding box of a row group; a missing X/Y range invalidates the bounds."""
+        box: dict[str, float | None] = {key: getattr(geo_statistics, key, None) for key in self._BOX_KEYS}
+        if any((value := box[key]) is None or not math.isfinite(value) for key in ("xmin", "ymin", "xmax", "ymax")):
+            self._valid = False
+            return
+        if self._box is None:
+            self._box = box
+            return
+        for key in self._BOX_KEYS:
+            current, new = self._box[key], box[key]
+            if current is None or new is None:
+                # Z and M are only kept when every row group has them
+                self._box[key] = None
+            else:
+                self._box[key] = min(current, new) if key.endswith("min") else max(current, new)
+
+    def _bounds(self) -> tuple[bytes, bytes] | None:
+        if not self._valid or self._box is None:
+            return None
+        xmin, ymin, xmax, ymax = (self._box[key] for key in ("xmin", "ymin", "xmax", "ymax"))
+        if xmin is None or ymin is None or xmax is None or ymax is None:
+            return None
+        if isinstance(self.primitive_type, GeographyType) and xmin > xmax:
+            # The bounding box wraps the antimeridian; omitting the bounds is always spec-compliant
+            return None
+        return geo_bounds_from_bbox(
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            zmin=self._box["zmin"],
+            zmax=self._box["zmax"],
+            mmin=self._box["mmin"],
+            mmax=self._box["mmax"],
+        )
+
+    def min_as_bytes(self) -> bytes | None:
+        bounds = self._bounds()
+        return bounds[0] if bounds is not None else None
+
+    def max_as_bytes(self) -> bytes | None:
+        bounds = self._bounds()
+        return bounds[1] if bounds is not None else None
+
+
+_PARQUET_TIME_UNIT_TO_NANOS = {"milliseconds": 1_000_000, "microseconds": 1_000, "nanoseconds": 1}
+
+
+def _parquet_timestamp_nanos_per_unit(statistics: pq.Statistics) -> int:
+    """Return the factor that converts raw Parquet timestamp statistics to nanoseconds."""
+    time_unit = json.loads(statistics.logical_type.to_json()).get("timeUnit", "nanoseconds")
+    if time_unit not in _PARQUET_TIME_UNIT_TO_NANOS:
+        raise ValueError(f"Unsupported Parquet timestamp unit: {time_unit}")
+    return _PARQUET_TIME_UNIT_TO_NANOS[time_unit]
 
 
 DEFAULT_TRUNCATION_LENGTH = 16
@@ -2423,6 +2979,10 @@ class PyArrowStatisticsCollector(PreOrderSchemaVisitor[list[StatisticsCollector]
         if is_nested and metrics_mode.type in [MetricModeTypes.TRUNCATE, MetricModeTypes.FULL]:
             metrics_mode = MetricsMode(MetricModeTypes.COUNTS)
 
+        if isinstance(primitive, VariantType) and metrics_mode.type in [MetricModeTypes.TRUNCATE, MetricModeTypes.FULL]:
+            # Variant bounds are Variant objects keyed by field path, which are not collected
+            metrics_mode = MetricsMode(MetricModeTypes.COUNTS)
+
         return [StatisticsCollector(field_id=self._field_id, iceberg_type=primitive, mode=metrics_mode, column_name=column_name)]
 
 
@@ -2507,6 +3067,9 @@ class ID2ParquetPathVisitor(PreOrderSchemaVisitor[list[ID2ParquetPath]]):
         return k + v
 
     def primitive(self, primitive: PrimitiveType) -> builtins.list[ID2ParquetPath]:
+        if isinstance(primitive, VariantType):
+            # Every variant has exactly one metadata value per row, so its column carries the counts of the variant
+            return [ID2ParquetPath(field_id=self._field_id, parquet_path=".".join([*self._path, _VARIANT_METADATA]))]
         return [ID2ParquetPath(field_id=self._field_id, parquet_path=".".join(self._path))]
 
 
@@ -2527,6 +3090,15 @@ def parquet_path_to_id_mapping(
     for pair in pre_order_visit(schema, ID2ParquetPathVisitor()):
         result[pair.parquet_path] = pair.field_id
     return result
+
+
+def _is_variant_child_path(path: str, parquet_column_mapping: dict[str, int]) -> bool:
+    """Return whether a Parquet column belongs to a variant group without being its metadata column."""
+    parts = path.split(".")
+    return any(
+        ".".join([*parts[:index], _VARIANT_METADATA]) in parquet_column_mapping and parts[index] != _VARIANT_METADATA
+        for index in range(1, len(parts))
+    )
 
 
 def data_file_statistics_from_parquet_metadata(
@@ -2558,9 +3130,10 @@ def data_file_statistics_from_parquet_metadata(
     null_value_counts: dict[int, int] = {}
     nan_value_counts: dict[int, int] = {}
 
-    col_aggs = {}
+    col_aggs: dict[int, StatsAggregator] = {}
 
     invalidate_col: set[int] = set()
+    invalidate_null_count: set[int] = set()
     for r in range(parquet_metadata.num_row_groups):
         # References:
         # https://github.com/apache/iceberg/blob/fc381a81a1fdb8f51a0637ca27cd30673bd7aad3/parquet/src/main/java/org/apache/iceberg/parquet/ParquetUtil.java#L232
@@ -2578,6 +3151,10 @@ def data_file_statistics_from_parquet_metadata(
 
         for pos in range(parquet_metadata.num_columns):
             column = row_group.column(pos)
+            if column.path_in_schema not in parquet_column_mapping and _is_variant_child_path(
+                column.path_in_schema, parquet_column_mapping
+            ):
+                continue
             field_id = parquet_column_mapping[column.path_in_schema]
 
             stats_col = stats_columns[field_id]
@@ -2589,6 +3166,19 @@ def data_file_statistics_from_parquet_metadata(
                 continue
 
             value_counts[field_id] = value_counts.get(field_id, 0) + column.num_values
+
+            if isinstance(stats_col.iceberg_type, (GeometryType, GeographyType)):
+                if column.is_stats_set and column.statistics.has_null_count:
+                    null_value_counts[field_id] = null_value_counts.get(field_id, 0) + column.statistics.null_count
+                else:
+                    invalidate_null_count.add(field_id)
+                if stats_col.mode != MetricsMode(MetricModeTypes.COUNTS):
+                    geo_agg = col_aggs.setdefault(field_id, GeospatialStatsAggregator(stats_col.iceberg_type))
+                    if isinstance(geo_agg, GeospatialStatsAggregator):
+                        # Parquet GEOMETRY/GEOGRAPHY logical types carry a bounding box (pyarrow >= 21)
+                        is_geo_stats_set = getattr(column, "is_geo_stats_set", False)
+                        geo_agg.update_box(column.geo_statistics if is_geo_stats_set else None)
+                continue
 
             if column.is_stats_set:
                 try:
@@ -2620,6 +3210,13 @@ def data_file_statistics_from_parquet_metadata(
                             if statistics.max_raw is not None
                             else None
                         )
+                    elif isinstance(stats_col.iceberg_type, (TimestampNanoType, TimestamptzNanoType)):
+                        # statistics.min/max are datetimes truncated to microseconds, so use the raw int64 values
+                        nanos_per_unit = _parquet_timestamp_nanos_per_unit(statistics)
+                        if statistics.min_raw is not None:
+                            col_aggs[field_id].update_min(statistics.min_raw * nanos_per_unit)
+                        if statistics.max_raw is not None:
+                            col_aggs[field_id].update_max(statistics.max_raw * nanos_per_unit)
                     else:
                         col_aggs[field_id].update_min(statistics.min)
                         col_aggs[field_id].update_max(statistics.max)
@@ -2635,6 +3232,9 @@ def data_file_statistics_from_parquet_metadata(
 
     for field_id in invalidate_col:
         col_aggs.pop(field_id, None)
+        null_value_counts.pop(field_id, None)
+
+    for field_id in invalidate_null_count:
         null_value_counts.pop(field_id, None)
 
     return DataFileStatistics(
@@ -2721,7 +3321,21 @@ class ParquetFormatModel(FileFormatModel):
 FileFormatFactory.register(ParquetFormatModel())
 
 
-def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteTask]) -> Iterator[DataFile]:
+def _row_lineage_write_schema(schema: Schema) -> Schema:
+    """Return the schema with the row lineage columns appended, for copying rows with their lineage."""
+    if (lineage_schema := schema_with_row_lineage(schema)) is None:
+        raise ValueError("Cannot preserve row lineage: a table column uses a reserved row lineage column name")
+    return lineage_schema
+
+
+def write_file(
+    io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteTask], preserve_row_lineage: bool = False
+) -> Iterator[DataFile]:
+    """Write the tasks to data files.
+
+    With ``preserve_row_lineage``, the ``_row_id`` and ``_last_updated_sequence_number`` columns of the tasks are
+    written as physical columns with their reserved field IDs, so rows copied by a rewrite keep their lineage.
+    """
     from pyiceberg.table import DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE, TableProperties
 
     file_format = FileFormat(
@@ -2739,6 +3353,8 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
             file_schema = sanitized_schema
         else:
             file_schema = table_schema
+        if preserve_row_lineage:
+            file_schema = _row_lineage_write_schema(file_schema)
 
         downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         batches = [
@@ -2749,6 +3365,7 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
                 downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
                 include_field_ids=True,
                 format_model=format_model,
+                for_write=True,
             )
             for batch in task.record_batches
         ]
@@ -2862,7 +3479,11 @@ def _check_pyarrow_schema_compatible(
 
     Raises:
         ValueError: If the schemas are not compatible.
+        NotImplementedError: If the schema contains a variant column.
     """
+    if any(isinstance(field.field_type, VariantType) for field in requested_schema._lazy_id_to_field.values()):
+        raise NotImplementedError("Writing variant is not supported until pyarrow can annotate the Parquet VARIANT logical type")
+
     name_mapping = requested_schema.name_mapping
 
     try:
@@ -2972,8 +3593,12 @@ def _dataframe_to_data_files(
     io: FileIO,
     write_uuid: uuid.UUID | None = None,
     counter: itertools.count[int] | None = None,
+    preserve_row_lineage: bool = False,
 ) -> Iterable[DataFile]:
     """Convert a PyArrow Table or RecordBatchReader into DataFiles.
+
+    With ``preserve_row_lineage``, ``df`` also holds the ``_row_id`` and ``_last_updated_sequence_number``
+    columns of copied rows, and they are written into the data files (see :func:`write_file`).
 
     For a ``pa.Table`` the data is materialised in memory and bin-packed into
     target-sized files (with partition splitting if the table is partitioned).
@@ -2996,7 +3621,8 @@ def _dataframe_to_data_files(
         property_name=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
         default=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
     )
-    name_mapping = table_metadata.schema().name_mapping
+    table_schema = table_metadata.schema()
+    name_mapping = (_row_lineage_write_schema(table_schema) if preserve_row_lineage else table_schema).name_mapping
     downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
     task_schema = pyarrow_to_schema(
         df.schema,
@@ -3015,6 +3641,7 @@ def _dataframe_to_data_files(
         yield from write_file(
             io=io,
             table_metadata=table_metadata,
+            preserve_row_lineage=preserve_row_lineage,
             tasks=(
                 WriteTask(write_uuid=write_uuid, task_id=next(counter), record_batches=batches, schema=task_schema)
                 for batches in bin_pack_record_batches(df, target_file_size)
@@ -3026,6 +3653,7 @@ def _dataframe_to_data_files(
         yield from write_file(
             io=io,
             table_metadata=table_metadata,
+            preserve_row_lineage=preserve_row_lineage,
             tasks=(
                 WriteTask(write_uuid=write_uuid, task_id=next(counter), record_batches=batches, schema=task_schema)
                 for batches in bin_pack_arrow_table(df, target_file_size)
@@ -3036,6 +3664,7 @@ def _dataframe_to_data_files(
         yield from write_file(
             io=io,
             table_metadata=table_metadata,
+            preserve_row_lineage=preserve_row_lineage,
             tasks=(
                 WriteTask(
                     write_uuid=write_uuid,

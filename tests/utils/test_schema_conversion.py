@@ -33,7 +33,9 @@ from pyiceberg.types import (
     NestedField,
     StringType,
     StructType,
+    TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
     UnknownType,
     UUIDType,
 )
@@ -347,6 +349,46 @@ def test_convert_timestamp_micros_type() -> None:
     assert actual == TimestampType()
 
 
+@pytest.mark.parametrize(
+    "avro_logical_type, expected",
+    [
+        ({"type": "long", "logicalType": "timestamp-nanos"}, TimestampNanoType()),
+        ({"type": "long", "logicalType": "timestamp-nanos", "adjust-to-utc": False}, TimestampNanoType()),
+        ({"type": "long", "logicalType": "timestamp-nanos", "adjust-to-utc": True}, TimestamptzNanoType()),
+    ],
+)
+def test_convert_timestamp_nanos_type(avro_logical_type: dict[str, Any], expected: Any) -> None:
+    assert AvroSchemaConversion()._convert_logical_type(avro_logical_type) == expected
+
+
+def test_timestamp_nanos_avro_roundtrip() -> None:
+    schema = Schema(
+        NestedField(1, "ts_ns", TimestampNanoType(), required=True),
+        NestedField(2, "tstz_ns", TimestamptzNanoType(), required=True),
+    )
+    avro_schema = AvroSchemaConversion().iceberg_to_avro(schema)
+    assert isinstance(avro_schema, dict)
+    assert AvroSchemaConversion().avro_to_iceberg(avro_schema) == schema
+
+
+def test_iceberg_to_avro_defaults() -> None:
+    schema = Schema(
+        NestedField(1, "d", DateType(), required=True, write_default=19052),
+        NestedField(2, "b", BinaryType(), required=False, write_default=b"\xff"),
+        NestedField(3, "u", UnknownType(), required=False),
+    )
+    avro_schema = AvroSchemaConversion().iceberg_to_avro(schema)
+    assert isinstance(avro_schema, dict)
+    fields = {field["name"]: field for field in avro_schema["fields"]}
+    # Required fields carry the default in the Avro encoding of the type
+    assert fields["d"]["default"] == 19052
+    # The default of a nullable union must match its first branch, null
+    assert (fields["b"]["type"], fields["b"]["default"]) == (["null", "bytes"], None)
+    # A column of type unknown is written as a plain null instead of an invalid union of nulls
+    assert (fields["u"]["type"], fields["u"]["default"]) == ("null", None)
+    assert AvroSchemaConversion().avro_to_iceberg(avro_schema).find_field("u") == NestedField(3, "u", UnknownType())
+
+
 def test_unknown_logical_type() -> None:
     """Test raising a ValueError when converting an unknown logical type as part of an Avro schema conversion"""
     avro_logical_type = {"type": "bytes", "logicalType": "date"}
@@ -389,3 +431,21 @@ def test_iceberg_to_avro_manifest(avro_schema_manifest_entry: dict[str, Any]) ->
     iceberg_schema = AvroSchemaConversion().avro_to_iceberg(avro_schema_manifest_entry)
     avro_result = AvroSchemaConversion().iceberg_to_avro(iceberg_schema, schema_name="manifest_entry")
     assert avro_schema_manifest_entry == avro_result
+
+
+def test_iceberg_variant_to_avro() -> None:
+    from pyiceberg.types import NestedField, VariantType
+
+    schema = Schema(NestedField(1, "v", VariantType(), required=False))
+    avro_schema = AvroSchemaConversion().iceberg_to_avro(schema, schema_name="table")
+
+    assert isinstance(avro_schema, dict)
+    assert avro_schema["fields"][0]["type"] == [
+        "null",
+        {
+            "type": "record",
+            "logicalType": "variant",
+            "fields": [{"name": "metadata", "type": "bytes"}, {"name": "value", "type": "bytes"}],
+            "name": "r1",
+        },
+    ]

@@ -49,7 +49,7 @@ from utils import TABLE_SCHEMA, _create_table
 @pytest.mark.parametrize(
     "part_col", ["int", "bool", "string", "string_long", "long", "float", "double", "date", "timestamp", "timestamptz", "binary"]
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_filter_null_partitioned(
     session_catalog: Catalog, spark: SparkSession, arrow_table_with_null: pa.Table, part_col: str, format_version: int
 ) -> None:
@@ -82,7 +82,7 @@ def test_query_filter_null_partitioned(
 @pytest.mark.parametrize(
     "part_col", ["int", "bool", "string", "string_long", "long", "float", "double", "date", "timestamp", "timestamptz", "binary"]
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_filter_without_data_partitioned(
     session_catalog: Catalog,
     spark: SparkSession,
@@ -119,7 +119,7 @@ def test_query_filter_without_data_partitioned(
 @pytest.mark.parametrize(
     "part_col", ["int", "bool", "string", "string_long", "long", "float", "double", "date", "timestamp", "timestamptz", "binary"]
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_filter_only_nulls_partitioned(
     session_catalog: Catalog, spark: SparkSession, arrow_table_with_only_nulls: pa.Table, part_col: str, format_version: int
 ) -> None:
@@ -151,7 +151,7 @@ def test_query_filter_only_nulls_partitioned(
 @pytest.mark.parametrize(
     "part_col", ["int", "bool", "string", "string_long", "long", "float", "double", "date", "timestamptz", "timestamp", "binary"]
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_filter_appended_null_partitioned(
     session_catalog: Catalog, spark: SparkSession, arrow_table_with_null: pa.Table, part_col: str, format_version: int
 ) -> None:
@@ -204,7 +204,7 @@ def test_query_filter_appended_null_partitioned(
 )
 @pytest.mark.parametrize(
     "format_version",
-    [1, 2],
+    [1, 2, 3],
 )
 def test_query_filter_dynamic_partition_overwrite_null_partitioned(
     session_catalog: Catalog, spark: SparkSession, arrow_table_with_null: pa.Table, part_col: str, format_version: int
@@ -285,7 +285,7 @@ def test_query_filter_v1_v2_append_null(
 @pytest.mark.parametrize(
     "part_col", ["int", "bool", "string", "string_long", "long", "float", "double", "date", "timestamp", "timestamptz", "binary"]
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_object_storage_location_provider_excludes_partition_path(
     session_catalog: Catalog, spark: SparkSession, arrow_table_with_null: pa.Table, part_col: str, format_version: int
 ) -> None:
@@ -353,7 +353,7 @@ def test_object_storage_location_provider_excludes_partition_path(
 )
 @pytest.mark.parametrize(
     "format_version",
-    [1, 2],
+    [1, 2, 3],
 )
 def test_dynamic_partition_overwrite_non_identity_transform(
     session_catalog: Catalog, arrow_table_with_null: pa.Table, spec: PartitionSpec, format_version: int
@@ -409,7 +409,7 @@ def test_dynamic_partition_overwrite_invalid_on_unpartitioned_table(
 )
 @pytest.mark.parametrize(
     "format_version",
-    [1, 2],
+    [1, 2, 3],
 )
 def test_dynamic_partition_overwrite_unpartitioned_evolve_to_identity_transform(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, part_col: str, format_version: int
@@ -655,7 +655,7 @@ def test_data_files_with_table_partitioned_with_null(
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "format_version",
-    [1, 2],
+    [1, 2, 3],
 )
 def test_dynamic_partition_overwrite_rename_column(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
     arrow_table = pa.Table.from_pydict(
@@ -702,7 +702,7 @@ def test_dynamic_partition_overwrite_rename_column(spark: SparkSession, session_
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "format_version",
-    [1, 2],
+    [1, 2, 3],
 )
 @pytest.mark.filterwarnings("ignore")
 def test_dynamic_partition_overwrite_evolve_partition(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
@@ -781,7 +781,7 @@ def test_invalid_arguments(spark: SparkSession, session_catalog: Catalog) -> Non
         (PartitionSpec(PartitionField(source_id=2, field_id=1001, transform=TruncateTransform(2), name="string_trunc"))),
     ],
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_truncate_transform(
     spec: PartitionSpec,
     spark: SparkSession,
@@ -834,7 +834,7 @@ def test_truncate_transform(
         ),
     ],
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_identity_and_bucket_transform_spec(
     spec: PartitionSpec,
     spark: SparkSession,
@@ -919,7 +919,7 @@ def test_unsupported_transform(
         (PartitionSpec(PartitionField(source_id=11, field_id=1001, transform=BucketTransform(2), name="binary_bucket")), 2),
     ],
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_bucket_transform(
     spark: SparkSession,
     session_catalog: Catalog,
@@ -970,7 +970,7 @@ def test_bucket_transform(
     ],
 )
 @pytest.mark.parametrize("part_col", ["date", "timestamp", "timestamptz"])
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_append_ymd_transform_partitioned(
     session_catalog: Catalog,
     spark: SparkSession,
@@ -1034,7 +1034,7 @@ def test_append_ymd_transform_partitioned(
         pytest.param(HourTransform(), {473328, 473352, 474072, 474096, 474102, None}, id="hour_transform"),
     ],
 )
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_append_transform_partition_verify_partitions_count(
     session_catalog: Catalog,
     spark: SparkSession,
@@ -1093,7 +1093,7 @@ def test_append_transform_partition_verify_partitions_count(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_append_multiple_partitions(
     session_catalog: Catalog,
     spark: SparkSession,
@@ -1157,7 +1157,7 @@ def test_append_multiple_partitions(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_stage_only_dynamic_partition_overwrite_files(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:

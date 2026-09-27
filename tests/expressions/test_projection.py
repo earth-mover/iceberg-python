@@ -49,7 +49,9 @@ from pyiceberg.types import (
     LongType,
     NestedField,
     StringType,
+    TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
 )
 
 
@@ -199,6 +201,38 @@ def test_hour_projection(schema: Schema, hour_spec: PartitionSpec) -> None:
     ]
 
     project = inclusive_projection(schema, hour_spec)
+    for index, predicate in enumerate(predicates):
+        expr = project(predicate)
+        assert expected[index] == expr, predicate
+
+
+@pytest.mark.parametrize("source_type, zone", [(TimestampNanoType(), ""), (TimestamptzNanoType(), "+00:00")])
+def test_day_projection_nano_timestamp(source_type: TimestampNanoType | TimestamptzNanoType, zone: str) -> None:
+    schema = Schema(NestedField(1, "ts_ns", source_type, required=False))
+    spec = PartitionSpec(PartitionField(1, 1000, DayTransform(), "ts_day"))
+    predicates = [
+        LessThan("ts_ns", f"2022-11-27T00:00:00{zone}"),
+        LessThanOrEqual("ts_ns", f"2022-11-27T00:00:00{zone}"),
+        GreaterThan("ts_ns", f"2022-11-26T23:59:59.999999999{zone}"),
+        GreaterThanOrEqual("ts_ns", f"2022-11-26T23:59:59.999999999{zone}"),
+        EqualTo("ts_ns", f"2022-11-27T10:00:00.000000001{zone}"),
+        NotEqualTo("ts_ns", f"2022-11-27T10:00:00{zone}"),
+        In("ts_ns", {f"2022-11-27T00:00:00{zone}", f"2022-11-26T23:59:59.999999999{zone}"}),
+        NotIn("ts_ns", {f"2022-11-27T00:00:00{zone}"}),
+    ]
+
+    expected = [
+        LessThanOrEqual("ts_day", 19322),
+        LessThanOrEqual("ts_day", 19323),
+        GreaterThanOrEqual("ts_day", 19323),
+        GreaterThanOrEqual("ts_day", 19322),
+        EqualTo("ts_day", 19323),
+        AlwaysTrue(),
+        In("ts_day", {19322, 19323}),
+        AlwaysTrue(),
+    ]
+
+    project = inclusive_projection(schema, spec)
     for index, predicate in enumerate(predicates):
         expr = project(predicate)
         assert expected[index] == expr, predicate

@@ -61,6 +61,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
 )
 
 if TYPE_CHECKING:
@@ -558,6 +559,8 @@ class PrimitiveWithPartnerVisitor(SchemaWithPartnerVisitor[P, T]):
             return self.visit_geometry(primitive, primitive_partner)
         elif isinstance(primitive, GeographyType):
             return self.visit_geography(primitive, primitive_partner)
+        elif isinstance(primitive, VariantType):
+            return self.visit_variant(primitive, primitive_partner)
         else:
             raise ValueError(f"Type not recognized: {primitive}")
 
@@ -636,6 +639,10 @@ class PrimitiveWithPartnerVisitor(SchemaWithPartnerVisitor[P, T]):
     @abstractmethod
     def visit_geography(self, geography_type: GeographyType, partner: P | None) -> T:
         """Visit a GeographyType."""
+
+    @abstractmethod
+    def visit_variant(self, variant_type: VariantType, partner: P | None) -> T:
+        """Visit a VariantType."""
 
 
 class PartnerAccessor(Generic[P], ABC):
@@ -764,6 +771,8 @@ class SchemaVisitorPerPrimitiveType(SchemaVisitor[T], ABC):
             return self.visit_geometry(primitive)
         elif isinstance(primitive, GeographyType):
             return self.visit_geography(primitive)
+        elif isinstance(primitive, VariantType):
+            return self.visit_variant(primitive)
         else:
             raise ValueError(f"Type not recognized: {primitive}")
 
@@ -842,6 +851,10 @@ class SchemaVisitorPerPrimitiveType(SchemaVisitor[T], ABC):
     @abstractmethod
     def visit_geography(self, geography_type: GeographyType) -> T:
         """Visit a GeographyType."""
+
+    @abstractmethod
+    def visit_variant(self, variant_type: VariantType) -> T:
+        """Visit a VariantType."""
 
 
 @dataclass(init=True, eq=True, frozen=True)
@@ -1347,6 +1360,8 @@ class _SetFreshIDs(PreOrderSchemaVisitor[IcebergType]):
                     field_type=field_type(),
                     required=field.required,
                     doc=field.doc,
+                    initial_default=field.initial_default,
+                    write_default=field.write_default,
                 )
             )
         return StructType(*new_fields)
@@ -1465,6 +1480,8 @@ class _SanitizeColumnsVisitor(SchemaVisitor[IcebergType | None]):
             field_type=field_result,
             doc=field.doc,
             required=field.required,
+            initial_default=field.initial_default,
+            write_default=field.write_default,
         )
 
     def struct(self, struct: StructType, field_results: builtins.list[IcebergType | None]) -> IcebergType | None:
@@ -1687,8 +1704,21 @@ def _(file_type: StringType, read_type: IcebergType) -> IcebergType:
 def _(file_type: BinaryType, read_type: IcebergType) -> IcebergType:
     if isinstance(read_type, StringType):
         return read_type
+    elif isinstance(read_type, (GeometryType, GeographyType)):
+        # Like fixed -> uuid, this is a read-time resolution rule rather than a schema evolution: geometry and
+        # geography values are stored as WKB, and PyArrow reports Parquet GEOMETRY/GEOGRAPHY columns as binary
+        return read_type
     else:
         raise ResolveError(f"Cannot promote an binary to {read_type}")
+
+
+@promote.register(DateType)
+def _(file_type: DateType, read_type: IcebergType) -> IcebergType:
+    if isinstance(read_type, (TimestampType, TimestampNanoType)):
+        # Format version 3 allows date -> timestamp and date -> timestamp_ns, reading a date as midnight
+        return read_type
+    else:
+        raise ResolveError(f"Cannot promote a date to {read_type}")
 
 
 @promote.register(DecimalType)
@@ -1709,6 +1739,23 @@ def _(file_type: FixedType, read_type: IcebergType) -> IcebergType:
         return read_type
     else:
         raise ResolveError(f"Cannot promote {file_type} to {read_type}")
+
+
+@promote.register(StructType)
+def _(file_type: StructType, read_type: IcebergType) -> IcebergType:
+    if isinstance(read_type, VariantType) and _is_variant_struct(file_type):
+        # A read-time resolution rule rather than a schema evolution: variant values are stored as a group
+        # with binary metadata and value fields, which surfaces as a struct when a file assigns them field ids
+        return read_type
+    else:
+        raise ResolveError(f"Cannot promote {file_type} to {read_type}")
+
+
+def _is_variant_struct(struct: StructType) -> bool:
+    """Return whether a struct has exactly the shape of an unshredded variant."""
+    return sorted(field.name for field in struct.fields) == ["metadata", "value"] and all(
+        isinstance(field.field_type, BinaryType) for field in struct.fields
+    )
 
 
 @promote.register(UnknownType)
@@ -1758,7 +1805,7 @@ class _SchemaCompatibilityVisitor(PreOrderSchemaVisitor[bool]):
         try:
             rhs = self.provided_schema.find_field(lhs.field_id)
         except ValueError:
-            if lhs.required:
+            if lhs.required and lhs.write_default is None:
                 self.rich_table.add_row("❌", str(lhs), "Missing")
                 return False
             else:

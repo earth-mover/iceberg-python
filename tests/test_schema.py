@@ -26,6 +26,7 @@ from pyiceberg.schema import (
     Accessor,
     Schema,
     _check_schema_compatible,
+    assign_fresh_schema_ids,
     build_position_accessors,
     index_by_id,
     index_by_name,
@@ -44,6 +45,8 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IcebergType,
     IntegerType,
     ListType,
@@ -53,11 +56,13 @@ from pyiceberg.types import (
     PrimitiveType,
     StringType,
     StructType,
+    TimestampNanoType,
     TimestampType,
     TimestamptzType,
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
 )
 
 TEST_PRIMITIVE_TYPES = [
@@ -897,6 +902,8 @@ def should_promote(file_type: IcebergType, read_type: IcebergType) -> bool:
         return can_promote_decimal(file_type, read_type)
     if isinstance(file_type, FixedType) and isinstance(read_type, UUIDType) and len(file_type) == 16:
         return True
+    if isinstance(file_type, DateType) and isinstance(read_type, (TimestampType, TimestampNanoType)):
+        return True
     return False
 
 
@@ -974,6 +981,23 @@ def test_decimal_promotion() -> None:
         promote(DecimalType(18, 2), DecimalType(9, 2))
 
 
+@pytest.mark.parametrize("read_type", [GeometryType(), GeometryType("srid:3857"), GeographyType("srid:4326", "vincenty")])
+def test_binary_resolves_to_geo_types(read_type: IcebergType) -> None:
+    # Parquet GEOMETRY/GEOGRAPHY columns are reported as binary by PyArrow
+    assert promote(BinaryType(), read_type) == read_type
+    with pytest.raises(ResolveError):
+        promote(StringType(), read_type)
+    with pytest.raises(ResolveError):
+        promote(FixedType(16), read_type)
+
+
+def test_update_column_binary_to_geometry_is_rejected(table_v2: Table) -> None:
+    current_schema = Schema(NestedField(field_id=1, name="aCol", field_type=BinaryType(), required=False))
+    update = UpdateSchema(transaction=Transaction(table_v2), schema=current_schema)
+    with pytest.raises(ValidationError, match="Cannot change column type: aCol: binary -> geometry"):
+        update.update_column("aCol", GeometryType())
+
+
 def test_unknown_type_promotion_to_primitive() -> None:
     """Test that UnknownType can be promoted to primitive types (V3+ behavior)"""
     unknown_type = UnknownType()
@@ -982,6 +1006,21 @@ def test_unknown_type_promotion_to_primitive() -> None:
     assert promote(unknown_type, IntegerType()) == IntegerType()
     assert promote(unknown_type, BooleanType()) == BooleanType()
     assert promote(unknown_type, FloatType()) == FloatType()
+
+
+def test_variant_group_struct_promotion_to_variant() -> None:
+    variant_group = StructType(
+        NestedField(3, "metadata", BinaryType(), required=True), NestedField(4, "value", BinaryType(), required=True)
+    )
+    assert promote(variant_group, VariantType()) == VariantType()
+
+    with pytest.raises(ResolveError, match="Cannot promote"):
+        promote(StructType(NestedField(3, "metadata", BinaryType(), required=True)), VariantType())
+    with pytest.raises(ResolveError, match="Cannot promote"):
+        promote(
+            StructType(NestedField(3, "metadata", BinaryType()), NestedField(4, "value", StringType())),
+            VariantType(),
+        )
 
 
 def test_unknown_type_promotion_to_non_primitive_raises_resolve_error() -> None:
@@ -1844,3 +1883,14 @@ def test_check_schema_compatible_optional_map_field_present() -> None:
     )
     # Should not raise - schemas match
     _check_schema_compatible(requested_schema, provided_schema)
+
+
+def test_assign_fresh_schema_ids_keeps_defaults() -> None:
+    schema = Schema(
+        NestedField(10, "c", StringType(), required=True, initial_default="init", write_default="wd"),
+        NestedField(11, "s", StructType(NestedField(12, "n", IntegerType(), required=False, initial_default=1, write_default=2))),
+    )
+    fresh = assign_fresh_schema_ids(schema)
+    assert fresh.find_field("c").field_id == 1
+    assert (fresh.find_field("c").initial_default, fresh.find_field("c").write_default) == ("init", "wd")
+    assert (fresh.find_field("s.n").initial_default, fresh.find_field("s.n").write_default) == (1, 2)

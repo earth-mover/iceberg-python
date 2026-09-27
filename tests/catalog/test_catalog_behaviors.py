@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pydantic_core import ValidationError
 from pytest_lazy_fixtures import lf
@@ -133,7 +134,7 @@ def test_create_table_without_namespace(catalog: Catalog, table_schema_nested: S
         catalog.create_table(table_name, table_schema_nested)
 
 
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_create_table_transaction(catalog: Catalog, format_version: int) -> None:
     identifier = f"default.arrow_create_table_transaction_{catalog.name}_{format_version}"
     try:
@@ -720,6 +721,200 @@ def test_append_table(catalog: Catalog, table_schema_simple: Schema, test_table_
     assert df == table.scan().to_arrow()
 
 
+def test_v3_row_lineage_on_commit(catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier) -> None:
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    table = catalog.create_table(test_table_identifier, table_schema_simple, properties={"format-version": "3"})
+    assert table.format_version == 3
+    assert table.metadata.next_row_id == 0
+
+    df = pa.Table.from_pydict(
+        {"foo": ["a", "b", "c"], "bar": [1, 2, 3], "baz": [True, False, True]},
+        schema=schema_to_pyarrow(table_schema_simple),
+    )
+    table.append(df)
+    table.append(df.slice(0, 2))
+
+    first, second = table.snapshots()
+    assert (first.first_row_id, first.added_rows) == (0, 3)
+    assert (second.first_row_id, second.added_rows) == (3, 2)
+    assert table.metadata.next_row_id == 5
+
+    # Fast appends carry over the manifests of earlier snapshots with their first row ids
+    manifests = second.manifests(table.io)
+    assert {m.first_row_id for m in manifests} == {0, 3}
+    assert all(entry.data_file.first_row_id is None for m in manifests for entry in _raw_entries(table, m))
+
+    # A copy-on-write delete keeps the row ids of the rows it copies into the rewritten data file
+    table.delete("bar = 1")
+    reloaded = catalog.load_table(test_table_identifier)
+    assert reloaded.metadata.next_row_id == reloaded.snapshots()[-1].first_row_id + reloaded.snapshots()[-1].added_rows  # type: ignore[operator]
+    assert reloaded.metadata.next_row_id == sum(s.added_rows or 0 for s in reloaded.snapshots())
+    assert sorted(reloaded.scan().to_arrow()["bar"].to_pylist()) == [2, 2, 3]
+
+
+def _lineage(table: Any) -> dict[int, tuple[int, int]]:
+    """Return the row id and last updated sequence number of each row, keyed by ``bar``."""
+    rows = table.scan(selected_fields=("bar", "_row_id", "_last_updated_sequence_number")).to_arrow().to_pylist()
+    return {row["bar"]: (row["_row_id"], row["_last_updated_sequence_number"]) for row in rows}
+
+
+def _v3_table_with_two_files(catalog: Catalog, schema: Schema, identifier: Identifier) -> Any:
+    catalog.create_namespace(Catalog.namespace_from(identifier))
+    table = catalog.create_table(identifier, schema, properties={"format-version": "3"})
+    arrow_schema = schema_to_pyarrow(schema)
+    table.append(
+        pa.Table.from_pydict({"foo": ["a", "b", "c"], "bar": [1, 2, 3], "baz": [True, False, True]}, schema=arrow_schema)
+    )
+    table.append(pa.Table.from_pydict({"foo": ["d", "e"], "bar": [4, 5], "baz": [False, True]}, schema=arrow_schema))
+    assert _lineage(table) == {1: (0, 1), 2: (1, 1), 3: (2, 1), 4: (3, 2), 5: (4, 2)}
+    return table
+
+
+def test_v3_copy_on_write_delete_preserves_row_lineage(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    table = _v3_table_with_two_files(catalog, table_schema_simple, test_table_identifier)
+
+    table.delete("bar = 5")
+
+    assert table.snapshots()[-1].summary.operation == Operation.OVERWRITE
+    assert _lineage(table) == {1: (0, 1), 2: (1, 1), 3: (2, 1), 4: (3, 2)}
+    # Copied rows still count as added rows, so the next row id stays above every assigned id
+    assert table.metadata.next_row_id == 6
+
+    # The lineage columns are stored in the rewritten file but do not surface in normal reads
+    rewritten = [task.file for task in table.scan(row_filter="bar = 4").plan_files()]
+    assert len(rewritten) == 1
+    physical_schema = pq.read_schema(table.io.new_input(rewritten[0].file_path).open())
+    assert physical_schema.field("_row_id").metadata[b"PARQUET:field_id"] == b"2147483540"
+    assert physical_schema.field("_last_updated_sequence_number").metadata[b"PARQUET:field_id"] == b"2147483539"
+    assert table.scan().to_arrow().column_names == ["foo", "bar", "baz"]
+    assert table.scan(selected_fields=("bar", "_row_id")).to_arrow().column_names == ["bar", "_row_id"]
+
+
+def test_v3_copy_on_write_delete_preserves_row_lineage_through_deletion_vector(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    table = _v3_table_with_two_files(catalog, table_schema_simple, test_table_identifier)
+    table.delete("bar = 1")
+    assert _lineage(table) == {2: (1, 1), 3: (2, 1), 4: (3, 2), 5: (4, 2)}
+
+    # Positions of a later deletion vector refer to the rewritten file, which keeps the copied lineage
+    table.transaction().set_properties(
+        {TableProperties.DELETE_MODE: TableProperties.DELETE_MODE_MERGE_ON_READ}
+    ).commit_transaction()
+    table.delete("bar = 2")
+    assert table.snapshots()[-1].summary.operation == Operation.DELETE
+    assert _lineage(table) == {3: (2, 1), 4: (3, 2), 5: (4, 2)}
+
+
+def test_v3_overwrite_preserves_row_lineage(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    table = _v3_table_with_two_files(catalog, table_schema_simple, test_table_identifier)
+
+    table.overwrite(
+        pa.Table.from_pydict({"foo": ["f"], "bar": [6], "baz": [False]}, schema=schema_to_pyarrow(table_schema_simple)),
+        overwrite_filter="bar = 5",
+    )
+
+    # Row 4 is copied with its lineage, row 6 is new and gets an id from its own snapshot
+    lineage = _lineage(table)
+    assert {bar: lineage[bar] for bar in (1, 2, 3, 4)} == {1: (0, 1), 2: (1, 1), 3: (2, 1), 4: (3, 2)}
+    assert lineage[6] == (6, 4)
+    assert table.metadata.next_row_id == 7
+
+
+def test_v3_upsert_preserves_row_lineage_of_unchanged_rows(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    table = _v3_table_with_two_files(catalog, table_schema_simple, test_table_identifier)
+
+    result = table.upsert(
+        pa.Table.from_pydict(
+            {"foo": ["a", "B"], "bar": [1, 2], "baz": [True, False]}, schema=schema_to_pyarrow(table_schema_simple)
+        )
+    )
+    assert (result.rows_updated, result.rows_inserted) == (1, 0)
+
+    lineage = _lineage(table)
+    # Untouched rows keep their lineage, including the ones copied out of the rewritten file
+    assert {bar: lineage[bar] for bar in (1, 3, 4, 5)} == {1: (0, 1), 3: (2, 1), 4: (3, 2), 5: (4, 2)}
+    # The updated row is written as a new row with a fresh id and the sequence number of its snapshot
+    updated_snapshot = table.snapshots()[-1]
+    assert lineage[2][0] >= 5
+    assert lineage[2][1] == updated_snapshot.sequence_number
+
+
+def _raw_entries(table: Any, manifest: Any) -> list[Any]:
+    """Read manifest entries without first row id inheritance, to check what the writer stored."""
+    from pyiceberg.avro.file import AvroFile
+    from pyiceberg.manifest import MANIFEST_ENTRY_SCHEMAS, DataFile, ManifestEntry
+
+    with AvroFile[ManifestEntry](
+        table.io.new_input(manifest.manifest_path), MANIFEST_ENTRY_SCHEMAS[3], read_types={-1: ManifestEntry, 2: DataFile}
+    ) as reader:
+        return list(reader)
+
+
+def test_v3_upgrade_then_append(catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier) -> None:
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    table = catalog.create_table(test_table_identifier, table_schema_simple, properties={"format-version": "2"})
+    df = pa.Table.from_pydict(
+        {"foo": ["a", "b"], "bar": [1, 2], "baz": [True, False]},
+        schema=schema_to_pyarrow(table_schema_simple),
+    )
+    table.append(df)
+
+    with table.transaction() as txn:
+        txn.upgrade_table_version(format_version=3)
+    table = catalog.load_table(test_table_identifier)
+    assert table.format_version == 3
+    assert table.metadata.next_row_id == 0
+    assert table.snapshots()[0].first_row_id is None
+
+    table.append(df.slice(0, 1))
+    snapshot = table.snapshots()[-1]
+    # The pre-upgrade manifest has no first row id yet, so it is assigned one together with the new manifest
+    assert (snapshot.first_row_id, snapshot.added_rows) == (0, 3)
+    assert table.metadata.next_row_id == 3
+    assert all(m.first_row_id is not None for m in snapshot.manifests(table.io))
+    assert len(table.scan().to_arrow()) == 3
+
+
+def test_failed_append_removes_written_files(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pyiceberg.table.update.snapshot as snapshot_module
+
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    table = catalog.create_table(test_table_identifier, table_schema_simple)
+    df = pa.Table.from_pydict(
+        {"foo": ["a"], "bar": [1], "baz": [True]},
+        schema=schema_to_pyarrow(table_schema_simple),
+    )
+
+    written: list[str] = []
+    original_append = snapshot_module._SnapshotProducer._append_written_data_file
+
+    def _track(self: Any, data_file: Any) -> Any:
+        written.append(data_file.file_path)
+        return original_append(self, data_file)
+
+    def _failing_write_manifest(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("Simulated manifest write failure")
+
+    monkeypatch.setattr(snapshot_module._SnapshotProducer, "_append_written_data_file", _track)
+    monkeypatch.setattr(snapshot_module, "write_manifest", _failing_write_manifest)
+
+    with pytest.raises(OSError, match="Simulated manifest write failure"):
+        table.append(df)
+
+    assert len(written) == 1
+    assert not table.io.new_input(written[0]).exists()
+    assert catalog.load_table(test_table_identifier).current_snapshot() is None
+
+
 # Test writes
 def test_table_writes_metadata_to_custom_location(
     catalog: Catalog,
@@ -803,7 +998,7 @@ def test_table_metadata_writes_reflect_latest_path(
     assert table.location_provider().new_metadata_location("metadata.json") == f"{new_metadata_path}/metadata.json"
 
 
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_write_and_evolve(catalog: Catalog, format_version: int) -> None:
     identifier = f"default.arrow_write_data_and_evolve_schema_v{format_version}"
 
@@ -849,7 +1044,7 @@ def test_write_and_evolve(catalog: Catalog, format_version: int) -> None:
 
 
 # Merge manifests
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_merge_manifests_local_file_system(catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
     # To catch manifest file name collision bug during merge:
     # https://github.com/apache/iceberg-python/pull/363#discussion_r1660691918

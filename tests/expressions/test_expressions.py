@@ -20,6 +20,7 @@ import copy
 import pickle
 import uuid
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from typing_extensions import assert_type
@@ -63,7 +64,7 @@ from pyiceberg.expressions import (
     UnboundPredicate,
 )
 from pyiceberg.expressions.literals import Literal, literal
-from pyiceberg.expressions.visitors import _from_byte_buffer
+from pyiceberg.expressions.visitors import _from_byte_buffer, expression_evaluator
 from pyiceberg.schema import Accessor, Schema
 from pyiceberg.typedef import Record
 from pyiceberg.types import (
@@ -71,6 +72,8 @@ from pyiceberg.types import (
     DecimalType,
     DoubleType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IntegerType,
     ListType,
     LongType,
@@ -1401,3 +1404,43 @@ _assert_literal_predicate_type(NotIn("a", ("a", "b", "c")))
 assert_type(In("a", ("a", "b", "c")), In)
 assert_type(In("a", (1, 2, 3)), In)
 assert_type(NotIn("a", ("a", "b", "c")), NotIn)
+
+
+WKB_POINT = bytes.fromhex("0101000000000000000000f03f0000000000000040")
+WKB_OTHER_POINT = bytes.fromhex("010100000000000000000000400000000000000040")
+
+
+@pytest.fixture
+def geo_schema() -> Schema:
+    return Schema(
+        NestedField(1, "geom", GeometryType("srid:3857"), required=False),
+        NestedField(2, "geog", GeographyType("srid:4326", "vincenty"), required=False),
+    )
+
+
+@pytest.mark.parametrize("column", ["geom", "geog"])
+@pytest.mark.parametrize(
+    "predicate, bound_type, matches",
+    [
+        (lambda col: EqualTo(col, WKB_POINT), BoundEqualTo, True),
+        (lambda col: EqualTo(col, WKB_OTHER_POINT), BoundEqualTo, False),
+        (lambda col: NotEqualTo(col, WKB_POINT), BoundNotEqualTo, False),
+        (lambda col: In(col, {WKB_POINT, WKB_OTHER_POINT}), BoundIn, True),
+        (lambda col: NotIn(col, {WKB_POINT, WKB_OTHER_POINT}), BoundNotIn, False),
+        (lambda col: IsNull(col), BoundIsNull, False),
+        (lambda col: NotNull(col), BoundNotNull, True),
+    ],
+)
+def test_bind_and_evaluate_geo_predicates(
+    geo_schema: Schema, column: str, predicate: Any, bound_type: type, matches: bool
+) -> None:
+    expr = predicate(column)
+    assert isinstance(expr.bind(geo_schema), bound_type)
+    assert expression_evaluator(geo_schema, expr, case_sensitive=True)(Record(WKB_POINT, WKB_POINT)) is matches
+
+
+@pytest.mark.parametrize("column", ["geom", "geog"])
+@pytest.mark.parametrize("predicate", [LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual])
+def test_bind_geo_ordering_predicate_fails(geo_schema: Schema, column: str, predicate: type[LiteralPredicate]) -> None:
+    with pytest.raises(ValueError, match=f"{predicate.__name__} is not supported for .* column {column}"):
+        predicate(column, WKB_POINT).bind(geo_schema)

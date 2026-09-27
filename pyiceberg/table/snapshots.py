@@ -27,7 +27,7 @@ from pydantic import Field, PrivateAttr, model_serializer
 
 from pyiceberg.environment_context import EnvironmentContext
 from pyiceberg.io import FileIO
-from pyiceberg.manifest import DataFile, DataFileContent, ManifestFile, _manifests
+from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestFile, _manifests
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec
 from pyiceberg.schema import Schema
 
@@ -37,6 +37,7 @@ from pyiceberg.typedef import IcebergBaseModel
 
 ADDED_DATA_FILES = "added-data-files"
 ADDED_DELETE_FILES = "added-delete-files"
+ADDED_DVS = "added-dvs"
 ADDED_EQUALITY_DELETES = "added-equality-deletes"
 ADDED_FILE_SIZE = "added-files-size"
 ADDED_POSITION_DELETES = "added-position-deletes"
@@ -46,6 +47,7 @@ DELETED_DATA_FILES = "deleted-data-files"
 DELETED_RECORDS = "deleted-records"
 ADDED_EQUALITY_DELETE_FILES = "added-equality-delete-files"
 REMOVED_DELETE_FILES = "removed-delete-files"
+REMOVED_DVS = "removed-dvs"
 REMOVED_EQUALITY_DELETES = "removed-equality-deletes"
 REMOVED_EQUALITY_DELETE_FILES = "removed-equality-delete-files"
 REMOVED_FILE_SIZE = "removed-files-size"
@@ -94,6 +96,17 @@ class IsolationLevel(str, Enum):
     SNAPSHOT = "snapshot"
 
 
+def _is_deletion_vector(data_file: DataFile) -> bool:
+    return data_file.content == DataFileContent.POSITION_DELETES and data_file.file_format == FileFormat.PUFFIN
+
+
+def _content_size_in_bytes(data_file: DataFile) -> int:
+    """Return the size of a file's content; a deletion vector only accounts for its blob, as in Java."""
+    if _is_deletion_vector(data_file) and data_file.content_size_in_bytes is not None:
+        return data_file.content_size_in_bytes
+    return data_file.file_size_in_bytes
+
+
 class UpdateMetrics:
     added_file_size: int
     removed_file_size: int
@@ -103,6 +116,8 @@ class UpdateMetrics:
     removed_eq_delete_files: int
     added_pos_delete_files: int
     removed_pos_delete_files: int
+    added_dvs: int
+    removed_dvs: int
     added_delete_files: int
     removed_delete_files: int
     added_records: int
@@ -121,6 +136,8 @@ class UpdateMetrics:
         self.removed_eq_delete_files = 0
         self.added_pos_delete_files = 0
         self.removed_pos_delete_files = 0
+        self.added_dvs = 0
+        self.removed_dvs = 0
         self.added_delete_files = 0
         self.removed_delete_files = 0
         self.added_records = 0
@@ -131,14 +148,17 @@ class UpdateMetrics:
         self.removed_eq_deletes = 0
 
     def add_file(self, data_file: DataFile) -> None:
-        self.added_file_size += data_file.file_size_in_bytes
+        self.added_file_size += _content_size_in_bytes(data_file)
 
         if data_file.content == DataFileContent.DATA:
             self.added_data_files += 1
             self.added_records += data_file.record_count
         elif data_file.content == DataFileContent.POSITION_DELETES:
             self.added_delete_files += 1
-            self.added_pos_delete_files += 1
+            if _is_deletion_vector(data_file):
+                self.added_dvs += 1
+            else:
+                self.added_pos_delete_files += 1
             self.added_pos_deletes += data_file.record_count
         elif data_file.content == DataFileContent.EQUALITY_DELETES:
             self.added_delete_files += 1
@@ -148,14 +168,17 @@ class UpdateMetrics:
             raise ValueError(f"Unknown data file content: {data_file.content}")
 
     def remove_file(self, data_file: DataFile) -> None:
-        self.removed_file_size += data_file.file_size_in_bytes
+        self.removed_file_size += _content_size_in_bytes(data_file)
 
         if data_file.content == DataFileContent.DATA:
             self.removed_data_files += 1
             self.deleted_records += data_file.record_count
         elif data_file.content == DataFileContent.POSITION_DELETES:
             self.removed_delete_files += 1
-            self.removed_pos_delete_files += 1
+            if _is_deletion_vector(data_file):
+                self.removed_dvs += 1
+            else:
+                self.removed_pos_delete_files += 1
             self.removed_pos_deletes += data_file.record_count
         elif data_file.content == DataFileContent.EQUALITY_DELETES:
             self.removed_delete_files += 1
@@ -174,6 +197,8 @@ class UpdateMetrics:
         set_when_positive(properties, self.removed_eq_delete_files, REMOVED_EQUALITY_DELETE_FILES)
         set_when_positive(properties, self.added_pos_delete_files, ADDED_POSITION_DELETE_FILES)
         set_when_positive(properties, self.removed_pos_delete_files, REMOVED_POSITION_DELETE_FILES)
+        set_when_positive(properties, self.added_dvs, ADDED_DVS)
+        set_when_positive(properties, self.removed_dvs, REMOVED_DVS)
         set_when_positive(properties, self.added_delete_files, ADDED_DELETE_FILES)
         set_when_positive(properties, self.removed_delete_files, REMOVED_DELETE_FILES)
         set_when_positive(properties, self.added_records, ADDED_RECORDS)

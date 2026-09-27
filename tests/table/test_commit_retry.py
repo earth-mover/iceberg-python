@@ -452,6 +452,69 @@ def test_snapshot_isolation_allows_concurrent_append_delete(catalog: Catalog) ->
     assert len(result) == 5
 
 
+def test_snapshot_isolation_merge_on_read_delete_retries_after_concurrent_append(catalog: Catalog) -> None:
+    """A deletion vector commit is rebuilt on top of a concurrent append under snapshot isolation."""
+    catalog.create_namespace("default")
+    catalog.create_table(
+        "default.mor_retry_test",
+        schema=_test_schema(),
+        properties={
+            "format-version": "3",
+            "write.delete.mode": "merge-on-read",
+            "write.delete.isolation-level": "snapshot",
+        },
+    )
+
+    import pyarrow as pa
+
+    df = pa.table({"x": [1, 2, 3]})
+
+    tbl = catalog.load_table("default.mor_retry_test")
+    tbl.append(df)
+    tbl.delete("x == 3")
+
+    tbl1 = catalog.load_table("default.mor_retry_test")
+    tbl2 = catalog.load_table("default.mor_retry_test")
+
+    tbl1.append(df)
+    tbl2.delete("x == 1")
+
+    refreshed = catalog.load_table("default.mor_retry_test")
+    # The delete did not see the concurrently appended rows, so their x == 1 row remains
+    assert sorted(refreshed.scan().to_arrow()["x"].to_pylist()) == [1, 2, 2, 3]
+    snapshot = refreshed.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    assert snapshot.summary["added-dvs"] == "1"
+    assert snapshot.summary["removed-dvs"] == "1"
+    assert snapshot.summary["total-data-files"] == "2"
+    assert snapshot.summary["total-delete-files"] == "1"
+    assert snapshot.summary["total-position-deletes"] == "2"
+
+
+def test_concurrent_merge_on_read_deletes_on_same_file_conflict(catalog: Catalog) -> None:
+    """Two deletion vectors for the same data file cannot be committed concurrently."""
+    catalog.create_namespace("default")
+    catalog.create_table(
+        "default.mor_conflict_test",
+        schema=_test_schema(),
+        properties={"format-version": "3", "write.delete.mode": "merge-on-read"},
+    )
+
+    import pyarrow as pa
+
+    tbl = catalog.load_table("default.mor_conflict_test")
+    tbl.append(pa.table({"x": [1, 2, 3]}))
+
+    tbl1 = catalog.load_table("default.mor_conflict_test")
+    tbl2 = catalog.load_table("default.mor_conflict_test")
+
+    tbl1.delete("x == 1")
+    with pytest.raises(ValidationException):
+        tbl2.delete("x == 2")
+
+    assert sorted(catalog.load_table("default.mor_conflict_test").scan().to_arrow()["x"].to_pylist()) == [2, 3]
+
+
 def test_uncommitted_manifests_tracked_correctly(catalog: Catalog) -> None:
     """Verify that uncommitted manifests are moved to _uncommitted_manifests on retry."""
     catalog.create_namespace("default")

@@ -17,6 +17,7 @@
 import pytest
 
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestEntry, ManifestEntryStatus
+from pyiceberg.table.delete_file import DeleteFileSet
 from pyiceberg.table.delete_file_index import PATH_FIELD_ID, DeleteFileIndex, PositionDeletes
 from pyiceberg.typedef import Record
 
@@ -65,17 +66,26 @@ def _create_partition_delete(sequence_number: int = 1, spec_id: int = 0, partiti
 
 
 def _create_deletion_vector(
-    sequence_number: int = 1, file_path: str = "s3://bucket/data.parquet", spec_id: int = 0
+    sequence_number: int = 1,
+    file_path: str = "s3://bucket/data.parquet",
+    spec_id: int = 0,
+    delete_file_path: str | None = None,
+    content_offset: int | None = None,
+    content_size_in_bytes: int | None = None,
 ) -> ManifestEntry:
     delete_file = DataFile.from_args(
+        _table_format_version=3,
         content=DataFileContent.POSITION_DELETES,
-        file_path=f"s3://bucket/deletion-vector-{sequence_number}.puffin",
+        file_path=delete_file_path or f"s3://bucket/deletion-vector-{sequence_number}.puffin",
         file_format=FileFormat.PUFFIN,
         partition=Record(),
         record_count=10,
         file_size_in_bytes=100,
         lower_bounds={PATH_FIELD_ID: file_path.encode()},
         upper_bounds={PATH_FIELD_ID: file_path.encode()},
+        referenced_data_file=file_path,
+        content_offset=content_offset,
+        content_size_in_bytes=content_size_in_bytes,
     )
     delete_file._spec_id = spec_id
     return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
@@ -148,17 +158,106 @@ def test_mix_path_and_partition_deletes() -> None:
     assert len(result) == 2
 
 
-def test_dvs_treated_as_position_deletes() -> None:
+def test_dv_supersedes_older_position_deletes() -> None:
     index = DeleteFileIndex()
+    partition = Record()
 
     index.add_delete_file(_create_positional_delete(sequence_number=2, file_path="s3://bucket/a.parquet"))
+    index.add_delete_file(_create_partition_delete(sequence_number=2), partition)
     index.add_delete_file(_create_deletion_vector(sequence_number=3, file_path="s3://bucket/a.parquet"))
 
-    data_file = _create_data_file(file_path="s3://bucket/a.parquet")
+    result = index.for_data_file(1, _create_data_file(file_path="s3://bucket/a.parquet"), partition)
+    assert [(d.file_format, d.referenced_data_file) for d in result] == [(FileFormat.PUFFIN, "s3://bucket/a.parquet")]
 
-    result = index.for_data_file(1, data_file)
-    assert len(result) == 2
-    assert all(d.content == DataFileContent.POSITION_DELETES for d in result)
+    # Position deletes for other data files are unaffected by the DV
+    other = index.for_data_file(1, _create_data_file(file_path="s3://bucket/b.parquet"), partition)
+    assert [d.file_path for d in other] == ["s3://bucket/pos-delete-2.parquet"]
+
+
+def test_position_deletes_newer_than_dv_are_kept() -> None:
+    index = DeleteFileIndex()
+
+    index.add_delete_file(_create_deletion_vector(sequence_number=2, file_path="s3://bucket/a.parquet"))
+    index.add_delete_file(_create_positional_delete(sequence_number=3, file_path="s3://bucket/a.parquet"))
+
+    result = index.for_data_file(1, _create_data_file(file_path="s3://bucket/a.parquet"))
+    assert {d.file_format for d in result} == {FileFormat.PUFFIN, FileFormat.PARQUET}
+
+
+def test_only_latest_dv_applies_to_data_file() -> None:
+    index = DeleteFileIndex()
+
+    index.add_delete_file(_create_deletion_vector(sequence_number=2, file_path="s3://bucket/a.parquet"))
+    index.add_delete_file(_create_deletion_vector(sequence_number=4, file_path="s3://bucket/a.parquet"))
+
+    result = index.for_data_file(1, _create_data_file(file_path="s3://bucket/a.parquet"))
+    assert [d.file_path for d in result] == ["s3://bucket/deletion-vector-4.puffin"]
+
+    # A DV older than the data file does not apply
+    assert len(index.for_data_file(5, _create_data_file(file_path="s3://bucket/a.parquet"))) == 0
+
+
+def test_dv_applies_only_to_referenced_data_file() -> None:
+    index = DeleteFileIndex()
+    dv = _create_deletion_vector(sequence_number=2, file_path="s3://bucket/a.parquet")
+    # Without path bounds, only referenced_data_file identifies the target data file
+    dv.data_file._data[10] = None
+    dv.data_file._data[11] = None
+    index.add_delete_file(dv)
+
+    assert len(index.for_data_file(1, _create_data_file(file_path="s3://bucket/a.parquet"))) == 1
+    assert len(index.for_data_file(1, _create_data_file(file_path="s3://bucket/b.parquet"))) == 0
+    assert index.referenced_delete_files() == [dv.data_file]
+
+
+def test_delete_file_set_uses_content_range_identity() -> None:
+    shared_file_path = "s3://bucket/deletion-vectors.bin"
+    first_dv = _create_deletion_vector(
+        sequence_number=2,
+        delete_file_path=shared_file_path,
+        content_offset=4,
+        content_size_in_bytes=10,
+    ).data_file
+    second_dv = _create_deletion_vector(
+        sequence_number=3,
+        delete_file_path=shared_file_path,
+        content_offset=40,
+        content_size_in_bytes=12,
+    ).data_file
+
+    assert first_dv == second_dv
+    assert len(DeleteFileSet([first_dv, second_dv])) == 2
+
+
+def test_dvs_in_one_puffin_file_apply_to_their_own_data_files() -> None:
+    index = DeleteFileIndex()
+    shared_file_path = "s3://bucket/deletion-vectors.puffin"
+
+    index.add_delete_file(
+        _create_deletion_vector(
+            sequence_number=2,
+            file_path="s3://bucket/a.parquet",
+            delete_file_path=shared_file_path,
+            content_offset=4,
+            content_size_in_bytes=10,
+        )
+    )
+    index.add_delete_file(
+        _create_deletion_vector(
+            sequence_number=2,
+            file_path="s3://bucket/b.parquet",
+            delete_file_path=shared_file_path,
+            content_offset=14,
+            content_size_in_bytes=12,
+        )
+    )
+
+    result_a = index.for_data_file(1, _create_data_file(file_path="s3://bucket/a.parquet"))
+    result_b = index.for_data_file(1, _create_data_file(file_path="s3://bucket/b.parquet"))
+
+    assert [(dv.file_path, dv.content_offset, dv.content_size_in_bytes) for dv in result_a] == [(shared_file_path, 4, 10)]
+    assert [(dv.file_path, dv.content_offset, dv.content_size_in_bytes) for dv in result_b] == [(shared_file_path, 14, 12)]
+    assert len(DeleteFileSet([*result_a, *result_b])) == 2
 
 
 def test_cannot_add_after_indexing() -> None:
@@ -187,3 +286,63 @@ def test_record_equality_for_partition_lookup() -> None:
 
     assert len(index.for_data_file(1, data_file, partition_b)) == 1
     assert len(index.for_data_file(1, data_file, partition_c)) == 0
+
+
+def _create_equality_delete(sequence_number: int = 1, spec_id: int = 0, partition: Record | None = None) -> ManifestEntry:
+    delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=f"s3://bucket/eq-delete-{spec_id}-{sequence_number}.parquet",
+        file_format=FileFormat.PARQUET,
+        partition=partition or Record(),
+        record_count=10,
+        file_size_in_bytes=100,
+        equality_ids=[1],
+    )
+    delete_file._spec_id = spec_id
+    return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
+
+
+def test_equality_deletes_apply_to_strictly_older_data() -> None:
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_equality_delete(sequence_number=2))
+    index.add_delete_file(_create_equality_delete(sequence_number=4))
+    data_file = _create_data_file()
+
+    assert not index.is_empty()
+    assert {f.file_path for f in index.for_data_file(1, data_file)} == {
+        "s3://bucket/eq-delete-0-2.parquet",
+        "s3://bucket/eq-delete-0-4.parquet",
+    }
+    # an equality delete with the same data sequence number as the data file does not apply
+    assert {f.file_path for f in index.for_data_file(2, data_file)} == {"s3://bucket/eq-delete-0-4.parquet"}
+    assert len(index.for_data_file(4, data_file)) == 0
+    assert len(index.referenced_delete_files()) == 2
+
+
+def test_partitioned_equality_deletes_apply_to_same_partition() -> None:
+    partition = Record(1)
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_equality_delete(sequence_number=2, spec_id=1, partition=partition), partition_key=partition)
+    data_file = _create_data_file(spec_id=1)
+
+    assert len(index.for_data_file(1, data_file, partition_key=Record(1))) == 1
+    assert len(index.for_data_file(1, data_file, partition_key=Record(2))) == 0
+    assert len(index.for_data_file(1, _create_data_file(spec_id=0), partition_key=Record(1))) == 0
+
+
+def test_unpartitioned_equality_deletes_are_global() -> None:
+    index = DeleteFileIndex()
+    # stored with an unpartitioned spec, so it applies to data files in every spec and partition
+    index.add_delete_file(_create_equality_delete(sequence_number=2, spec_id=0))
+    data_file = _create_data_file(spec_id=1)
+
+    assert len(index.for_data_file(1, data_file, partition_key=Record(7))) == 1
+
+
+def test_equality_deletes_are_kept_alongside_dvs() -> None:
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_deletion_vector(sequence_number=3))
+    index.add_delete_file(_create_equality_delete(sequence_number=2))
+
+    delete_files = index.for_data_file(1, _create_data_file())
+    assert {f.content for f in delete_files} == {DataFileContent.POSITION_DELETES, DataFileContent.EQUALITY_DELETES}

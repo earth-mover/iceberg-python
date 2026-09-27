@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint:disable=redefined-outer-name
+import struct
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -58,6 +59,8 @@ from pyiceberg.typedef import Record
 from pyiceberg.types import (
     DoubleType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IcebergType,
     IntegerType,
     LongType,
@@ -1907,3 +1910,83 @@ def test_strict_metrics_eval_bounds_after_promotion(
 
     evaluator = _StrictMetricsEvaluator(schema, op("col", lit))
     assert evaluator.eval(data_file) == expected
+
+
+def _wkb_point(x: float, y: float) -> bytes:
+    return struct.pack("<BIdd", 1, 1, x, y)
+
+
+# LINESTRING(1 1, 9 9): inside the bounding box below, but byte-wise greater than both bound points
+GEO_LINESTRING = struct.pack("<BII4d", 1, 2, 2, 1.0, 1.0, 9.0, 9.0)
+
+
+@pytest.fixture
+def geo_schema() -> Schema:
+    return Schema(
+        NestedField(1, "geom", GeometryType(), required=False),
+        NestedField(2, "geog", GeographyType("srid:4326", "vincenty"), required=False),
+        NestedField(3, "geom_nulls", GeometryType(), required=False),
+    )
+
+
+@pytest.fixture
+def geo_data_file() -> DataFile:
+    # Geo bounds are the corner points of the bounding box, not the smallest and largest WKB values
+    return DataFile.from_args(
+        file_path="geo.parquet",
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=10,
+        file_size_in_bytes=3,
+        value_counts={1: 10, 2: 10, 3: 10},
+        null_value_counts={1: 0, 2: 0, 3: 10},
+        lower_bounds={1: _wkb_point(0, 0), 2: _wkb_point(0, 0)},
+        upper_bounds={1: _wkb_point(10, 10), 2: _wkb_point(10, 10)},
+    )
+
+
+@pytest.mark.parametrize("column", ["geom", "geog"])
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        lambda col: EqualTo(col, GEO_LINESTRING),
+        lambda col: NotEqualTo(col, GEO_LINESTRING),
+        lambda col: In(col, {GEO_LINESTRING, _wkb_point(20, 20)}),
+        lambda col: NotIn(col, {GEO_LINESTRING}),
+        lambda col: EqualTo(col, _wkb_point(0, 0)),
+        lambda col: NotNull(col),
+    ],
+)
+def test_inclusive_metrics_geo_bounds_are_not_compared(
+    geo_schema: Schema, geo_data_file: DataFile, column: str, predicate: Any
+) -> None:
+    assert _InclusiveMetricsEvaluator(geo_schema, predicate(column)).eval(geo_data_file) == ROWS_MIGHT_MATCH
+
+
+@pytest.mark.parametrize("column", ["geom", "geog"])
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        lambda col: EqualTo(col, GEO_LINESTRING),
+        lambda col: NotEqualTo(col, GEO_LINESTRING),
+        lambda col: In(col, {_wkb_point(0, 0), _wkb_point(10, 10)}),
+        lambda col: NotIn(col, {GEO_LINESTRING}),
+        lambda col: EqualTo(col, _wkb_point(0, 0)),
+        lambda col: IsNull(col),
+    ],
+)
+def test_strict_metrics_geo_bounds_are_not_compared(
+    geo_schema: Schema, geo_data_file: DataFile, column: str, predicate: Any
+) -> None:
+    assert _StrictMetricsEvaluator(geo_schema, predicate(column)).eval(geo_data_file) == ROWS_MIGHT_NOT_MATCH
+
+
+def test_metrics_geo_null_counts_still_apply(geo_schema: Schema, geo_data_file: DataFile) -> None:
+    assert _InclusiveMetricsEvaluator(geo_schema, EqualTo("geom_nulls", GEO_LINESTRING)).eval(geo_data_file) == ROWS_CANNOT_MATCH
+    assert _InclusiveMetricsEvaluator(geo_schema, In("geom_nulls", {GEO_LINESTRING})).eval(geo_data_file) == ROWS_CANNOT_MATCH
+    assert _InclusiveMetricsEvaluator(geo_schema, NotNull("geom_nulls")).eval(geo_data_file) == ROWS_CANNOT_MATCH
+    assert _InclusiveMetricsEvaluator(geo_schema, IsNull("geom")).eval(geo_data_file) == ROWS_CANNOT_MATCH
+    assert _StrictMetricsEvaluator(geo_schema, NotEqualTo("geom_nulls", GEO_LINESTRING)).eval(geo_data_file) == ROWS_MUST_MATCH
+    assert _StrictMetricsEvaluator(geo_schema, NotIn("geom_nulls", {GEO_LINESTRING})).eval(geo_data_file) == ROWS_MUST_MATCH
+    assert _StrictMetricsEvaluator(geo_schema, IsNull("geom_nulls")).eval(geo_data_file) == ROWS_MUST_MATCH
+    assert _StrictMetricsEvaluator(geo_schema, NotNull("geom")).eval(geo_data_file) == ROWS_MUST_MATCH

@@ -62,6 +62,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
     strtobool,
 )
 from pyiceberg.utils.datetime import (
@@ -76,11 +77,15 @@ from pyiceberg.utils.datetime import (
     time_str_to_micros,
     time_to_micros,
     timestamp_to_micros,
+    timestamp_to_nanos,
     timestamptz_to_micros,
+    timestamptz_to_nanos,
     to_human_day,
     to_human_time,
     to_human_timestamp,
+    to_human_timestamp_ns,
     to_human_timestamptz,
+    to_human_timestamptz_ns,
 )
 from pyiceberg.utils.decimal import decimal_to_bytes, unscaled_to_decimal
 
@@ -327,6 +332,12 @@ def _(_: UnknownType, value: Any) -> None:
     return None
 
 
+@to_bytes.register(VariantType)
+def _(_: VariantType, value: Any) -> bytes:
+    """Raise, since the spec does not define a single-value binary serialization for variant."""
+    raise ValueError("Variant values have no single-value binary serialization")
+
+
 @singledispatch  # type: ignore
 def from_bytes(primitive_type: PrimitiveType, b: bytes) -> L:  # type: ignore
     """Convert bytes to a built-in python value.
@@ -404,6 +415,12 @@ def _(type_: UnknownType, buf: bytes) -> None:
     return None
 
 
+@from_bytes.register(VariantType)
+def _(type_: VariantType, buf: bytes) -> None:
+    """Raise, since the spec does not define a single-value binary serialization for variant."""
+    raise ValueError("Variant values have no single-value binary serialization")
+
+
 @singledispatch  # type: ignore
 def to_json(primitive_type: PrimitiveType, val: Any) -> L:  # type: ignore
     """Convert built-in python values into JSON value types.
@@ -463,6 +480,22 @@ def _(_: TimestamptzType, val: int | datetime) -> str:
     return to_human_timestamptz(val)
 
 
+@to_json.register(TimestampNanoType)
+def _(_: TimestampNanoType, val: int | datetime) -> str:
+    """Python datetime (without timezone) or nanoseconds since epoch serializes into an ISO8601 timestamp with nanoseconds."""
+    if isinstance(val, datetime):
+        val = datetime_to_nanos(val)
+    return to_human_timestamp_ns(val)
+
+
+@to_json.register(TimestamptzNanoType)
+def _(_: TimestamptzNanoType, val: int | datetime) -> str:
+    """Python datetime (with timezone) or nanoseconds since epoch serializes into an ISO8601 timestamp with nanoseconds."""
+    if isinstance(val, datetime):
+        val = datetime_to_nanos(val)
+    return to_human_timestamptz_ns(val)
+
+
 @to_json.register(FloatType)
 @to_json.register(DoubleType)
 def _(_: FloatType | DoubleType, val: float) -> float:
@@ -507,6 +540,21 @@ def _(_: DecimalType, val: Decimal) -> str:
 def _(_: UUIDType, val: uuid.UUID) -> str:
     """Serialize into a JSON string."""
     return str(val)
+
+
+@to_json.register(UnknownType)
+def _(_: UnknownType, val: None) -> None:
+    """Columns of type unknown always default to null, so only null has a JSON representation."""
+    if val is not None:
+        raise ValueError(f"Columns of type unknown must default to null, got: {val}")
+
+
+@to_json.register(VariantType)
+def _(_: VariantType, val: Any) -> None:
+    """Variant columns must default to null, so the only JSON single value is null."""
+    if val is not None:
+        raise ValueError(f"Variant columns must default to null, got: {val!r}")
+    return None
 
 
 @to_json.register(GeometryType)
@@ -613,6 +661,26 @@ def _(_: TimestamptzType, val: str | int | datetime) -> datetime:
         return val
 
 
+@from_json.register(TimestampNanoType)
+def _(_: TimestampNanoType, val: str | int | datetime) -> int:
+    """JSON ISO8601 string into nanoseconds since epoch, since Python datetimes cannot hold nanoseconds."""
+    if isinstance(val, str):
+        return timestamp_to_nanos(val)
+    if isinstance(val, datetime):
+        return datetime_to_nanos(val)
+    return val
+
+
+@from_json.register(TimestamptzNanoType)
+def _(_: TimestamptzNanoType, val: str | int | datetime) -> int:
+    """JSON ISO8601 string into nanoseconds since epoch, since Python datetimes cannot hold nanoseconds."""
+    if isinstance(val, str):
+        return timestamptz_to_nanos(val)
+    if isinstance(val, datetime):
+        return datetime_to_nanos(val)
+    return val
+
+
 @from_json.register(FloatType)
 @from_json.register(DoubleType)
 def _(_: FloatType | DoubleType, val: float) -> float:
@@ -664,9 +732,26 @@ def _(_: UUIDType, val: str | bytes | uuid.UUID) -> uuid.UUID:
         return val
 
 
+@from_json.register(UnknownType)
+def _(_: UnknownType, val: None) -> None:
+    """Columns of type unknown always default to null, so only null has a JSON representation."""
+    if val is not None:
+        raise ValueError(f"Columns of type unknown must default to null, got: {val}")
+
+
+@from_json.register(VariantType)
+def _(_: VariantType, val: Any) -> None:
+    """Variant columns must default to null, so the only JSON single value is null."""
+    if val is not None:
+        raise ValueError(f"Variant columns must default to null, got: {val!r}")
+    return None
+
+
 @from_json.register(GeometryType)
-def _(_: GeometryType, val: str | bytes) -> bytes:
+def _(_: GeometryType, val: str | bytes | None) -> bytes | None:
     """Convert JSON WKT string into WKB bytes per Iceberg spec.
+
+    Geometry columns must default to null, so a null value is returned as-is.
 
     Note: This requires WKT to WKB conversion which is not yet implemented.
     The Iceberg spec requires geometry values to be represented as WKT strings
@@ -675,7 +760,7 @@ def _(_: GeometryType, val: str | bytes) -> bytes:
     Raises:
         NotImplementedError: WKT to WKB conversion is not yet supported.
     """
-    if isinstance(val, bytes):
+    if val is None or isinstance(val, bytes):
         # Already WKB bytes, return as-is
         return val
     raise NotImplementedError(
@@ -685,8 +770,10 @@ def _(_: GeometryType, val: str | bytes) -> bytes:
 
 
 @from_json.register(GeographyType)
-def _(_: GeographyType, val: str | bytes) -> bytes:
+def _(_: GeographyType, val: str | bytes | None) -> bytes | None:
     """Convert JSON WKT string into WKB bytes per Iceberg spec.
+
+    Geography columns must default to null, so a null value is returned as-is.
 
     Note: This requires WKT to WKB conversion which is not yet implemented.
     The Iceberg spec requires geography values to be represented as WKT strings
@@ -695,7 +782,7 @@ def _(_: GeographyType, val: str | bytes) -> bytes:
     Raises:
         NotImplementedError: WKT to WKB conversion is not yet supported.
     """
-    if isinstance(val, bytes):
+    if val is None or isinstance(val, bytes):
         # Already WKB bytes, return as-is
         return val
     raise NotImplementedError(

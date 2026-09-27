@@ -17,6 +17,7 @@
 
 import base64
 import datetime as py_datetime
+import re
 import struct
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -27,7 +28,7 @@ from typing import Literal as LiteralType
 from uuid import UUID
 
 import mmh3
-from pydantic import Field, PositiveInt, PrivateAttr
+from pydantic import Field, PositiveInt, PrivateAttr, model_serializer, model_validator
 
 from pyiceberg.expressions import (
     BoundEqualTo,
@@ -62,9 +63,11 @@ from pyiceberg.expressions.literals import (
     Literal,
     LongLiteral,
     TimestampLiteral,
+    TimestampNanoLiteral,
+    TimestamptzNanoLiteral,
     literal,
 )
-from pyiceberg.typedef import IcebergRootModel, L
+from pyiceberg.typedef import IcebergBaseModel, IcebergRootModel, L
 from pyiceberg.types import (
     BinaryType,
     DateType,
@@ -82,6 +85,7 @@ from pyiceberg.types import (
     TimestamptzType,
     TimeType,
     UUIDType,
+    VariantType,
 )
 from pyiceberg.utils import datetime
 from pyiceberg.utils.decimal import decimal_to_bytes, truncate_decimal
@@ -107,6 +111,8 @@ DAY = "day"
 HOUR = "hour"
 
 BUCKET_PARSER = ParseNumberFromBrackets(BUCKET)
+# name[argument] with nothing after the closing bracket
+_BRACKET_FORM = re.compile(r"^[a-z_]+\[[^\]]*\]$")
 TRUNCATE_PARSER = ParseNumberFromBrackets(TRUNCATE)
 
 
@@ -212,9 +218,11 @@ def parse_transform(v: Any) -> Transform[Any, Any]:
             return IdentityTransform()
         elif v == VOID:
             return VoidTransform()
-        elif v.startswith(BUCKET):
+        elif _BRACKET_FORM.match(v) and v.startswith(f"{BUCKET}["):
+            # A known transform with a malformed argument is an error; an unknown name that merely shares the
+            # prefix (bucketv2[4], bucket[4]v2) is a different transform and is preserved as-is below
             return BucketTransform(num_buckets=BUCKET_PARSER.match(v))
-        elif v.startswith(TRUNCATE):
+        elif _BRACKET_FORM.match(v) and v.startswith(f"{TRUNCATE}["):
             return TruncateTransform(width=TRUNCATE_PARSER.match(v))
         elif v == YEAR:
             return YearTransform()
@@ -472,8 +480,10 @@ class YearTransform(TimeTransform[S]):
         elif isinstance(source, (TimestampNanoType, TimestamptzNanoType)):
 
             def year_func(v: Any) -> int:
-                # python datetime has no nanoseconds support.
-                # nanosecond datetimes will be expressed as int as a workaround
+                # python datetime has no nanoseconds support, so datetimes are converted with microsecond precision
+                if isinstance(v, py_datetime.datetime):
+                    v = datetime.datetime_to_nanos(v)
+
                 return datetime.nanos_to_years(v)
 
         else:
@@ -532,8 +542,10 @@ class MonthTransform(TimeTransform[S]):
         elif isinstance(source, (TimestampNanoType, TimestamptzNanoType)):
 
             def month_func(v: Any) -> int:
-                # python datetime has no nanoseconds support.
-                # nanosecond datetimes will be expressed as int as a workaround
+                # python datetime has no nanoseconds support, so datetimes are converted with microsecond precision
+                if isinstance(v, py_datetime.datetime):
+                    v = datetime.datetime_to_nanos(v)
+
                 return datetime.nanos_to_months(v)
 
         else:
@@ -593,8 +605,10 @@ class DayTransform(TimeTransform[S]):
         elif isinstance(source, (TimestampNanoType, TimestamptzNanoType)):
 
             def day_func(v: Any) -> int:
-                # python datetime has no nanoseconds support.
-                # nanosecond datetimes will be expressed as int as a workaround
+                # python datetime has no nanoseconds support, so datetimes are converted with microsecond precision
+                if isinstance(v, py_datetime.datetime):
+                    v = datetime.datetime_to_nanos(v)
+
                 return datetime.nanos_to_days(v)
 
         else:
@@ -654,8 +668,10 @@ class HourTransform(TimeTransform[S]):
         elif isinstance(source, (TimestampNanoType, TimestamptzNanoType)):
 
             def hour_func(v: Any) -> int:
-                # python datetime has no nanoseconds support.
-                # nanosecond datetimes will be expressed as int as a workaround
+                # python datetime has no nanoseconds support, so datetimes are converted with microsecond precision
+                if isinstance(v, py_datetime.datetime):
+                    v = datetime.datetime_to_nanos(v)
+
                 return datetime.nanos_to_hours(v)
 
         else:
@@ -706,7 +722,7 @@ class IdentityTransform(Transform[S, S]):
         return lambda v: v
 
     def can_transform(self, source: IcebergType) -> bool:
-        return source.is_primitive and not isinstance(source, (GeographyType, GeometryType))
+        return source.is_primitive and not isinstance(source, (GeographyType, GeometryType, VariantType))
 
     def result_type(self, source: IcebergType) -> IcebergType:
         return source
@@ -955,6 +971,16 @@ def _(_type: IcebergType, value: int) -> str:
     return datetime.to_human_timestamptz(value)
 
 
+@_int_to_human_string.register(TimestampNanoType)
+def _(_type: IcebergType, value: int) -> str:
+    return datetime.to_human_timestamp_ns(value)
+
+
+@_int_to_human_string.register(TimestamptzNanoType)
+def _(_type: IcebergType, value: int) -> str:
+    return datetime.to_human_timestamptz_ns(value)
+
+
 class UnknownTransform(Transform[S, T]):
     """A transform that represents when an unknown transform is provided.
 
@@ -987,9 +1013,23 @@ class UnknownTransform(Transform[S, T]):
     def strict_project(self, name: str, pred: BoundPredicate) -> UnboundPredicate | None:
         return None
 
+    def __str__(self) -> str:
+        """Return the original transform name so it round-trips through serialization."""
+        return self._transform
+
     def __repr__(self) -> str:
         """Return the string representation of the UnknownTransform class."""
         return f"UnknownTransform(transform={repr(self._transform)})"
+
+    def __eq__(self, other: Any) -> bool:
+        """Compare the preserved transform name, since every unknown transform shares one root value."""
+        if isinstance(other, UnknownTransform):
+            return self._transform == other._transform
+        return False
+
+    def __hash__(self) -> int:
+        """Hash the preserved transform name so distinct unknown transforms do not collide."""
+        return hash((self.root, self._transform))
 
     def pyarrow_transform(self, source: IcebergType) -> "Callable[[pa.Array], pa.Array]":
         raise NotImplementedError()
@@ -1003,8 +1043,9 @@ class VoidTransform(Transform[S, None], Singleton):
     def transform(self, source: IcebergType) -> Callable[[S | None], T | None]:
         return lambda v: None
 
-    def can_transform(self, _: IcebergType) -> bool:
-        return True
+    def can_transform(self, source: IcebergType) -> bool:
+        # Variant cannot be the source of any partition or sort field
+        return not isinstance(source, VariantType)
 
     def result_type(self, source: IcebergType) -> IcebergType:
         return source
@@ -1031,12 +1072,82 @@ class VoidTransform(Transform[S, None], Singleton):
         return lambda arr: pa.nulls(len(arr), type=arr.type)
 
 
+class TransformSourceMixin(IcebergBaseModel):
+    """Shared `source-id` and `source-ids` handling for fields that apply a transform to source columns.
+
+    Both partition fields and sort fields carry this pair, and the spec writes only one of the
+    two: `source-id` for a transform with a single argument, `source-ids` for a multi-argument
+    transform. This mixin owns reading, serializing and reporting them, so that neither field
+    type has to reach into the raw keys.
+
+    Attributes:
+        source_id(int): The source column id of the table's schema.
+        source_ids(list[int] | None): The source column ids of a multi-argument transform.
+    """
+
+    source_id: int = Field(alias="source-id")
+    source_ids: list[int] | None = Field(alias="source-ids", default=None, repr=False)
+
+    @property
+    def transform_arguments(self) -> list[int]:
+        """Return the source column ids that the transform is applied to."""
+        source_ids = self.source_ids
+        if source_ids is not None and len(source_ids) > 1:
+            return list(source_ids)
+        return [self.source_id]
+
+    @property
+    def is_multi_argument(self) -> bool:
+        """Return True if the transform takes more than one source column."""
+        return len(self.transform_arguments) > 1
+
+    @model_validator(mode="before")
+    @classmethod
+    def map_source_ids_onto_source_id(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "source-ids" not in data:
+            return data
+
+        if "source-id" in data:
+            raise ValueError("source-id and source-ids are mutually exclusive")
+
+        source_ids = data["source-ids"]
+        if not isinstance(source_ids, list):
+            return data
+        if len(source_ids) == 0:
+            raise ValueError("Empty source-ids is not allowed")
+
+        data["source-id"] = source_ids[0]
+        if len(source_ids) == 1:
+            data.pop("source-ids", None)
+            return data
+
+        if data.get("transform") is None:
+            raise ValueError("Transform is required for a multi-argument field")
+        # Multi-argument transforms cannot be evaluated; per the spec, v3 readers
+        # must read tables with such transforms, ignoring them
+        data["transform"] = UnknownTransform(transform=str(data["transform"]))
+        return data
+
+    @model_serializer(mode="wrap")
+    def _serialize_source_ids(self, handler: Any) -> Any:
+        serialized = handler(self)
+        # Per the spec, single-argument transforms write only source-id and
+        # multi-argument transforms write only source-ids
+        if self.is_multi_argument:
+            serialized.pop("source-id", None)
+        else:
+            serialized.pop("source-ids", None)
+        return serialized
+
+
 def _truncate_number(
     name: str, pred: BoundLiteralPredicate, transform: Callable[[Any | None], Any | None]
 ) -> UnboundPredicate | None:
     boundary = pred.literal
 
-    if not isinstance(boundary, (LongLiteral, DecimalLiteral, DateLiteral, TimestampLiteral)):
+    if not isinstance(
+        boundary, (LongLiteral, DecimalLiteral, DateLiteral, TimestampLiteral, TimestampNanoLiteral, TimestamptzNanoLiteral)
+    ):
         raise ValueError(f"Expected a numeric literal, got: {type(boundary)}")
 
     if isinstance(pred, BoundLessThan):
@@ -1058,7 +1169,9 @@ def _truncate_number_strict(
 ) -> UnboundPredicate | None:
     boundary = pred.literal
 
-    if not isinstance(boundary, (LongLiteral, DecimalLiteral, DateLiteral, TimestampLiteral)):
+    if not isinstance(
+        boundary, (LongLiteral, DecimalLiteral, DateLiteral, TimestampLiteral, TimestampNanoLiteral, TimestamptzNanoLiteral)
+    ):
         raise ValueError(f"Expected a numeric literal, got: {type(boundary)}")
 
     if isinstance(pred, BoundLessThan):

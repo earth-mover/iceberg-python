@@ -100,6 +100,8 @@ from pyiceberg.types import (
     DoubleType,
     FixedType,
     FloatType,
+    GeographyType,
+    GeometryType,
     IntegerType,
     LongType,
     PrimitiveType,
@@ -111,6 +113,7 @@ from pyiceberg.types import (
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
 )
 
 
@@ -609,6 +612,51 @@ def test_json_serialize_roundtrip(primitive_type: PrimitiveType, value: Any) -> 
     assert value == conversions.from_json(primitive_type, conversions.to_json(primitive_type, value))
 
 
+@pytest.mark.parametrize(
+    "primitive_type, value, expected",
+    [
+        (TimestampNanoType(), 1510871468123456789, "2017-11-16T22:31:08.123456789"),
+        (TimestampNanoType(), -1, "1969-12-31T23:59:59.999999999"),
+        (TimestampNanoType(), datetime(2017, 11, 16, 22, 31, 8, 123456), "2017-11-16T22:31:08.123456000"),
+        (TimestamptzNanoType(), 1510871468123456789, "2017-11-16T22:31:08.123456789+00:00"),
+        (
+            TimestamptzNanoType(),
+            datetime(2017, 11, 16, 22, 31, 8, 123456, tzinfo=timezone.utc),
+            "2017-11-16T22:31:08.123456000+00:00",
+        ),
+    ],
+)
+def test_json_timestamp_nano_serialization(primitive_type: PrimitiveType, value: Any, expected: str) -> None:
+    assert conversions.to_json(primitive_type, value) == expected
+
+
+@pytest.mark.parametrize(
+    "primitive_type, json_value, expected",
+    [
+        (TimestampNanoType(), "2017-11-16T22:31:08.123456789", 1510871468123456789),
+        (TimestampNanoType(), "2017-11-16T22:31:08.1", 1510871468100000000),
+        (TimestampNanoType(), "2017-11-16T22:31:08", 1510871468000000000),
+        (TimestamptzNanoType(), "2017-11-16T22:31:08.123456789+00:00", 1510871468123456789),
+        (TimestamptzNanoType(), "2017-11-16T14:31:08.123456789-08:00", 1510871468123456789),
+    ],
+)
+def test_json_timestamp_nano_deserialization(primitive_type: PrimitiveType, json_value: str, expected: int) -> None:
+    assert conversions.from_json(primitive_type, json_value) == expected
+
+
+@pytest.mark.parametrize("primitive_type", [TimestampNanoType(), TimestamptzNanoType()])
+def test_json_timestamp_nano_roundtrip(primitive_type: PrimitiveType) -> None:
+    value = 1510871468123456789
+    assert conversions.from_json(primitive_type, conversions.to_json(primitive_type, value)) == value
+
+
+def test_json_timestamp_nano_zone_errors() -> None:
+    with pytest.raises(ValueError, match="Zone offset provided, but not expected"):
+        conversions.from_json(TimestampNanoType(), "2017-11-16T22:31:08.123456789+00:00")
+    with pytest.raises(ValueError, match="Missing zone offset"):
+        conversions.from_json(TimestamptzNanoType(), "2017-11-16T22:31:08.123456789")
+
+
 def test_unknown_type_conversions() -> None:
     """Unknown values are always null, so they have no binary or partition representation."""
     unknown = UnknownType()
@@ -619,8 +667,27 @@ def test_unknown_type_conversions() -> None:
 
     # The spec defines no JSON single-value representation for unknown, since a
     # non-null initial-default or write-default is invalid for the type.
-    with pytest.raises(TypeError):
+    assert conversions.to_json(unknown, None) is None
+    assert conversions.from_json(unknown, None) is None
+    with pytest.raises(ValueError, match="must default to null"):
         conversions.to_json(unknown, "iceberg")
 
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="must default to null"):
         conversions.from_json(unknown, "iceberg")
+
+
+@pytest.mark.parametrize("geo_type", [GeometryType(), GeographyType()])
+def test_geo_json_null_default(geo_type: PrimitiveType) -> None:
+    """Geometry and geography columns must default to null, so null deserializes to None."""
+    assert conversions.from_json(geo_type, None) is None
+
+
+def test_variant_type_conversions() -> None:
+    assert conversions.to_json(VariantType(), None) is None
+    assert conversions.from_json(VariantType(), None) is None
+    with pytest.raises(ValueError, match="must default to null"):
+        conversions.from_json(VariantType(), {"a": 1})
+    with pytest.raises(ValueError, match="no single-value binary serialization"):
+        conversions.to_bytes(VariantType(), b"\x00")
+    with pytest.raises(ValueError, match="no single-value binary serialization"):
+        conversions.from_bytes(VariantType(), b"\x00")

@@ -31,6 +31,7 @@ from pyiceberg.transforms import (
     IdentityTransform,
     MonthTransform,
     TruncateTransform,
+    VoidTransform,
     YearTransform,
 )
 from pyiceberg.typedef import Record
@@ -45,11 +46,14 @@ from pyiceberg.types import (
     PrimitiveType,
     StringType,
     StructType,
+    TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
     TimestamptzType,
     TimeType,
     UnknownType,
     UUIDType,
+    VariantType,
 )
 
 
@@ -102,6 +106,31 @@ def test_partition_compatible_with() -> None:
         field1,
     )
     rhs = PartitionSpec(field1, field2)
+    assert not lhs.compatible_with(rhs)
+
+
+def test_partition_compatible_with_compares_every_source_id() -> None:
+    # multi-argument fields differ in their later source ids, which the first one cannot show
+    lhs = PartitionSpec.model_validate(
+        {"spec-id": 0, "fields": [{"field-id": 1000, "name": "p", "source-ids": [1, 2], "transform": "zorder(a,b)"}]}
+    )
+    rhs = PartitionSpec.model_validate(
+        {"spec-id": 0, "fields": [{"field-id": 1000, "name": "p", "source-ids": [1, 3], "transform": "zorder(a,c)"}]}
+    )
+
+    assert not lhs.compatible_with(rhs)
+    assert lhs.compatible_with(lhs)
+
+
+def test_partition_compatible_with_compares_unknown_transform_names() -> None:
+    # same source ids, different transform: the names are all that separates them
+    lhs = PartitionSpec.model_validate(
+        {"spec-id": 0, "fields": [{"field-id": 1000, "name": "p", "source-ids": [1, 2], "transform": "zorder(a,b)"}]}
+    )
+    rhs = PartitionSpec.model_validate(
+        {"spec-id": 0, "fields": [{"field-id": 1000, "name": "p", "source-ids": [1, 2], "transform": "somethingelse(a,b)"}]}
+    )
+
     assert not lhs.compatible_with(rhs)
 
 
@@ -170,6 +199,26 @@ def test_partition_spec_to_path() -> None:
     # Both partition field names and values should be URL encoded, with spaces mapping to plus signs, to match the Java
     # behaviour: https://github.com/apache/iceberg/blob/ca3db931b0f024f0412084751ac85dd4ef2da7e7/api/src/main/java/org/apache/iceberg/PartitionSpec.java#L198-L204
     assert spec.partition_to_path(record, schema) == "my%23str%25bucket=my%2Bstr/other+str%2Bbucket=%28+%29/my%21int%3Abucket=10"
+
+
+@pytest.mark.parametrize(
+    "field_type, expected_path",
+    [
+        (TimestampType(), "ts=2025-02-23T20%3A21%3A44.375612"),
+        (TimestamptzType(), "ts=2025-02-23T20%3A21%3A44.375612%2B00%3A00"),
+        (TimestampNanoType(), "ts=2025-02-23T20%3A21%3A44.375612001"),
+        (TimestamptzNanoType(), "ts=2025-02-23T20%3A21%3A44.375612001%2B00%3A00"),
+    ],
+)
+def test_partition_spec_to_path_timestamp(field_type: PrimitiveType, expected_path: str) -> None:
+    schema = Schema(NestedField(field_id=1, name="ts", field_type=field_type, required=False))
+    spec = PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="ts"))
+
+    # Nanosecond timestamps carry three extra sub-microsecond digits; the microsecond
+    # value 1740342104375612 is the same instant as 1740342104375612001 nanoseconds.
+    value = 1740342104375612001 if isinstance(field_type, (TimestampNanoType, TimestamptzNanoType)) else 1740342104375612
+
+    assert spec.partition_to_path(Record(value), schema) == expected_path
 
 
 def test_partition_spec_to_path_dropped_source_id() -> None:
@@ -279,6 +328,52 @@ def test_deserialize_partition_field_source_id_and_source_ids_rejected() -> None
         PartitionField.model_validate_json(json_partition_spec)
 
 
+def test_deserialize_partition_field_multi_arg() -> None:
+    import json as json_lib
+
+    from pyiceberg.transforms import UnknownTransform
+
+    json_partition_spec = """{"source-ids": [1, 2], "field-id": 1000, "transform": "bucket[4]", "name": "multi_bucket"}"""
+    field = PartitionField.model_validate_json(json_partition_spec)
+
+    # v3 readers must read tables with multi-argument transforms, treating them as unknown
+    assert isinstance(field.transform, UnknownTransform)
+    assert field.source_id == 1
+    assert field.source_ids == [1, 2]
+
+    # the field must round-trip: source-ids only, with the original transform name
+    serialized = json_lib.loads(field.model_dump_json())
+    assert serialized["source-ids"] == [1, 2]
+    assert "source-id" not in serialized
+    assert serialized["transform"] == "bucket[4]"
+
+    assert str(field) == "1000: multi_bucket: bucket[4](1, 2)"
+
+
+def test_serialize_partition_field_single_source_id_only() -> None:
+    import json as json_lib
+
+    json_partition_spec = """{"source-ids": [1], "field-id": 1000, "transform": "truncate[19]", "name": "str_truncate"}"""
+    field = PartitionField.model_validate_json(json_partition_spec)
+    serialized = json_lib.loads(field.model_dump_json())
+    assert serialized["source-id"] == 1
+    assert "source-ids" not in serialized
+    # a single-element source-ids is normalized onto source-id
+    assert field.source_ids is None
+
+
+def test_partition_type_with_multi_arg_field() -> None:
+    from pyiceberg.types import StringType
+
+    schema = Schema(NestedField(1, "a", IntegerType()), NestedField(2, "b", IntegerType()))
+    field = PartitionField.model_validate_json(
+        """{"source-ids": [1, 2], "field-id": 1000, "transform": "bucket[4]", "name": "m"}"""
+    )
+    spec = PartitionSpec(field)
+    struct = spec.partition_type(schema)
+    assert struct.fields[0].field_type == StringType()
+
+
 def test_incompatible_source_column_not_found() -> None:
     schema = Schema(NestedField(1, "foo", IntegerType()), NestedField(2, "bar", IntegerType()))
 
@@ -310,3 +405,85 @@ def test_incompatible_transform_source_type() -> None:
         spec.check_compatible(schema)
 
     assert "Invalid source field foo with type int for transform: year" in str(exc.value)
+
+
+def test_deserialize_partition_field_multi_arg_requires_transform() -> None:
+    json_partition_spec = """{"source-ids": [1, 2], "field-id": 1000, "name": "m"}"""
+    with pytest.raises(Exception, match="Transform is required for a multi-argument field"):
+        PartitionField.model_validate_json(json_partition_spec)
+
+
+def test_partition_field_transform_arguments() -> None:
+    single = PartitionField(source_id=1, field_id=1000, transform=TruncateTransform(width=19), name="str_truncate")
+    assert single.transform_arguments == [1]
+    assert single.is_multi_argument is False
+
+    multi = PartitionField.model_validate_json(
+        """{"source-ids": [1, 2], "field-id": 1000, "transform": "bucket[4]", "name": "m"}"""
+    )
+    assert multi.transform_arguments == [1, 2]
+    assert multi.is_multi_argument is True
+
+
+@pytest.mark.parametrize("transform", [IdentityTransform(), BucketTransform(4), TruncateTransform(4), VoidTransform()])
+def test_variant_cannot_be_partition_source(transform: Any) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType()), NestedField(2, "v", VariantType()))
+    assert not transform.can_transform(VariantType())
+    if not isinstance(transform, VoidTransform):
+        spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=transform, name="v_part"))
+        with pytest.raises(ValidationError, match="Invalid source field v with type variant"):
+            spec.check_compatible(schema)
+
+
+def test_multi_arg_partition_spec_in_table_metadata() -> None:
+    from pyiceberg.expressions import EqualTo
+    from pyiceberg.expressions.visitors import inclusive_projection
+    from pyiceberg.table.metadata import TableMetadataUtil
+    from pyiceberg.transforms import UnknownTransform
+
+    metadata = TableMetadataUtil.parse_obj(
+        {
+            "format-version": 3,
+            "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+            "location": "s3://bucket/table",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1602638573590,
+            "last-column-id": 2,
+            "current-schema-id": 0,
+            "schemas": [
+                {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [
+                        {"id": 1, "name": "a", "required": False, "type": "int"},
+                        {"id": 2, "name": "b", "required": False, "type": "int"},
+                    ],
+                }
+            ],
+            "default-spec-id": 0,
+            "partition-specs": [
+                {"spec-id": 0, "fields": [{"name": "ab", "transform": "zorder", "source-ids": [1, 2], "field-id": 1000}]}
+            ],
+            "last-partition-id": 1000,
+            "default-sort-order-id": 1,
+            "sort-orders": [
+                {
+                    "order-id": 1,
+                    "fields": [{"transform": "zorder", "source-ids": [1, 2], "direction": "asc", "null-order": "nulls-first"}],
+                }
+            ],
+            "next-row-id": 0,
+        }
+    )
+
+    spec = metadata.spec()
+    assert isinstance(spec.fields[0].transform, UnknownTransform)
+    assert spec.fields[0].transform_arguments == [1, 2]
+    assert metadata.sort_order_by_id(1).fields[0].transform_arguments == [1, 2]  # type: ignore[union-attr]
+    # unknown transforms produce no partition predicate, so nothing is pruned
+    projected = inclusive_projection(metadata.schema(), spec)(EqualTo("a", 1))
+    assert str(projected) == "AlwaysTrue()"
+    # the metadata round-trips with source-ids
+    serialized = metadata.model_dump_json()
+    assert '"source-ids":[1,2]' in serialized
+    assert TableMetadataUtil.parse_raw(serialized).spec() == spec

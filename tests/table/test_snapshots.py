@@ -28,7 +28,7 @@ from pyiceberg import __version__
 from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import ValidationException
 from pyiceberg.io.pyarrow import _dataframe_to_data_files
-from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile
+from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestContent, ManifestEntryStatus, ManifestFile
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table
@@ -821,3 +821,224 @@ def test_overwrite_rejects_explicit_delete_without_parent_snapshot(
         with empty.transaction() as tx:
             with tx.update_snapshot().overwrite() as overwrite:
                 overwrite.delete_data_file(stale_file)
+
+
+def test_snapshot_summary_collector_deletion_vectors(table_schema_simple: Schema) -> None:
+    def _delete_file(file_format: FileFormat, record_count: int) -> DataFile:
+        return DataFile.from_args(
+            _table_format_version=3,
+            content=DataFileContent.POSITION_DELETES,
+            file_format=file_format,
+            record_count=record_count,
+            file_size_in_bytes=1000,
+            content_size_in_bytes=40 if file_format == FileFormat.PUFFIN else None,
+            partition=Record(),
+        )
+
+    ssc = SnapshotSummaryCollector()
+    ssc.add_file(_delete_file(FileFormat.PUFFIN, 3), schema=table_schema_simple)
+    ssc.remove_file(_delete_file(FileFormat.PUFFIN, 1), schema=table_schema_simple)
+    ssc.remove_file(_delete_file(FileFormat.PARQUET, 2), schema=table_schema_simple)
+
+    # As in Java, a DV is not a position delete file, and its size is the size of its blob
+    assert ssc.build() == {
+        "added-delete-files": "1",
+        "added-dvs": "1",
+        "added-files-size": "40",
+        "added-position-deletes": "3",
+        "removed-delete-files": "2",
+        "removed-dvs": "1",
+        "removed-files-size": "1040",
+        "removed-position-delete-files": "1",
+        "removed-position-deletes": "3",
+    }
+
+
+def _merge_on_read_table(catalog: Catalog, format_version: int = 3, partition_spec: PartitionSpec | None = None) -> Table:
+    catalog.create_namespace("default")
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+        NestedField(2, "category", StringType(), required=False),
+    )
+    table = catalog.create_table(
+        "default.merge_on_read",
+        schema=schema,
+        partition_spec=partition_spec or PartitionSpec(),
+        properties={"format-version": str(format_version), "write.delete.mode": "merge-on-read"},
+    )
+    table.append(pa.table({"id": pa.array(range(10), pa.int32()), "category": ["a"] * 5 + ["b"] * 5}))
+    return table
+
+
+def _live_delete_files(table: Table) -> list[DataFile]:
+    snapshot = table.current_snapshot()
+    assert snapshot is not None
+    return [
+        entry.data_file
+        for manifest in snapshot.manifests(table.io)
+        if manifest.content == ManifestContent.DELETES
+        for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=True)
+    ]
+
+
+def _row_ids(table: Table) -> dict[int, int]:
+    rows = table.scan(selected_fields=("id", "_row_id")).to_arrow()
+    return dict(zip(rows["id"].to_pylist(), rows["_row_id"].to_pylist(), strict=True))
+
+
+def test_merge_on_read_delete_writes_deletion_vector(catalog: Catalog) -> None:
+    table = _merge_on_read_table(catalog)
+    data_file = next(iter(table.scan().plan_files())).file
+    row_ids_before = _row_ids(table)
+
+    table.delete("id == 2 or id == 7")
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    assert snapshot.summary.operation == Operation.DELETE
+    assert snapshot.summary["added-dvs"] == "1"
+    assert snapshot.summary["added-delete-files"] == "1"
+    assert snapshot.summary["added-position-deletes"] == "2"
+    assert snapshot.summary["total-delete-files"] == "1"
+    assert snapshot.summary["total-position-deletes"] == "2"
+    assert snapshot.summary["total-data-files"] == "1"
+    assert snapshot.summary["total-records"] == "10"
+    # No rows are added, so no row ids are assigned
+    assert snapshot.added_rows == 0
+
+    (dv,) = _live_delete_files(table)
+    assert dv.content == DataFileContent.POSITION_DELETES
+    assert dv.file_format == FileFormat.PUFFIN
+    assert dv.file_path.endswith("-deletes.puffin")
+    assert dv.referenced_data_file == data_file.file_path
+    assert dv.content_offset == 4
+    assert dv.content_size_in_bytes is not None and dv.content_size_in_bytes > 0
+    assert dv.record_count == 2
+
+    assert sorted(table.scan().to_arrow()["id"].to_pylist()) == [0, 1, 3, 4, 5, 6, 8, 9]
+    assert table.scan().count() == 8
+    # The data file is not rewritten, so the row ids of the remaining rows are unchanged
+    row_ids_after = _row_ids(table)
+    assert row_ids_after == {id_: row_id for id_, row_id in row_ids_before.items() if id_ not in (2, 7)}
+
+
+def test_merge_on_read_delete_replaces_deletion_vector(catalog: Catalog) -> None:
+    table = _merge_on_read_table(catalog)
+    table.delete("id == 2")
+    (previous_dv,) = _live_delete_files(table)
+
+    table.delete("id in (2, 5, 6)")
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    assert snapshot.summary.operation == Operation.DELETE
+    assert snapshot.summary["added-dvs"] == "1"
+    assert snapshot.summary["removed-dvs"] == "1"
+    assert snapshot.summary["removed-delete-files"] == "1"
+    assert snapshot.summary["added-position-deletes"] == "3"
+    assert snapshot.summary["removed-position-deletes"] == "1"
+    assert snapshot.summary["total-delete-files"] == "1"
+    assert snapshot.summary["total-position-deletes"] == "3"
+
+    # One DV per data file, holding the union of the deleted positions
+    (dv,) = _live_delete_files(table)
+    assert dv.file_path != previous_dv.file_path
+    assert dv.record_count == 3
+    assert sorted(table.scan().to_arrow()["id"].to_pylist()) == [0, 1, 3, 4, 7, 8, 9]
+
+    # The previous DV is recorded as deleted in this snapshot
+    deleted = [
+        entry
+        for manifest in snapshot.manifests(table.io)
+        if manifest.content == ManifestContent.DELETES
+        for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=False)
+        if entry.status == ManifestEntryStatus.DELETED
+    ]
+    assert [(entry.data_file.file_path, entry.snapshot_id) for entry in deleted] == [
+        (previous_dv.file_path, snapshot.snapshot_id)
+    ]
+
+
+def test_merge_on_read_delete_of_deleted_rows_is_a_no_op(catalog: Catalog) -> None:
+    table = _merge_on_read_table(catalog)
+    table.delete("id == 2")
+    snapshot_count = len(table.snapshots())
+
+    table.delete("id == 2")
+
+    assert len(table.snapshots()) == snapshot_count
+
+
+def test_merge_on_read_delete_drops_fully_matching_files(catalog: Catalog) -> None:
+    table = _merge_on_read_table(
+        catalog,
+        partition_spec=PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="category")),
+    )
+
+    table.delete("category == 'a'")
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    assert snapshot.summary["deleted-data-files"] == "1"
+    assert "added-dvs" not in snapshot.summary.additional_properties
+    assert _live_delete_files(table) == []
+    assert sorted(table.scan().to_arrow()["id"].to_pylist()) == [5, 6, 7, 8, 9]
+
+
+def test_merge_on_read_delete_partitioned(catalog: Catalog) -> None:
+    table = _merge_on_read_table(
+        catalog,
+        partition_spec=PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="category")),
+    )
+    data_files = {task.file.file_path: task.file for task in table.scan().plan_files()}
+
+    table.delete("id in (1, 8)")
+
+    dvs = _live_delete_files(table)
+    assert len(dvs) == 2
+    # All DVs of a commit are written to one Puffin file, as one blob per data file
+    assert len({dv.file_path for dv in dvs}) == 1
+    assert len({dv.content_offset for dv in dvs}) == 2
+    for dv in dvs:
+        assert dv.referenced_data_file is not None
+        data_file = data_files[dv.referenced_data_file]
+        assert dv.partition == data_file.partition
+        assert dv.spec_id == data_file.spec_id
+        assert dv.record_count == 1
+    assert sorted(table.scan().to_arrow()["id"].to_pylist()) == [0, 2, 3, 4, 5, 6, 7, 9]
+    assert table.scan(row_filter="category == 'b'").count() == 4
+
+
+def test_merge_on_read_delete_requires_format_version_3(catalog: Catalog) -> None:
+    table = _merge_on_read_table(catalog, format_version=2)
+
+    with pytest.warns(UserWarning, match=re.escape("Merge-on-read deletes require format version 3 (deletion vectors)")):
+        table.delete("id == 2")
+
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    assert snapshot.summary.operation == Operation.OVERWRITE
+    assert _live_delete_files(table) == []
+    assert table.scan().count() == 9
+
+
+def test_overwrite_keeps_copy_on_write_with_merge_on_read(catalog: Catalog) -> None:
+    table = _merge_on_read_table(catalog)
+
+    table.overwrite(pa.table({"id": pa.array([100], pa.int32()), "category": ["c"]}), overwrite_filter="id == 2")
+
+    assert _live_delete_files(table) == []
+    assert sorted(table.scan().to_arrow()["id"].to_pylist()) == [0, 1, 3, 4, 5, 6, 7, 8, 9, 100]
+
+
+def test_failed_merge_on_read_delete_removes_puffin_file(catalog: Catalog) -> None:
+    table = _merge_on_read_table(catalog)
+    concurrent = catalog.load_table(table.name())
+    concurrent.delete("id == 3")
+
+    with pytest.raises(ValidationException):
+        table.delete("id == 2")
+
+    data_path = Path(urlparse(table.location()).path) / "data"
+    assert len(list(data_path.glob("*-deletes.puffin"))) == 1
+    assert sorted(catalog.load_table(table.name()).scan().to_arrow()["id"].to_pylist()) == [0, 1, 2, 4, 5, 6, 7, 8, 9]

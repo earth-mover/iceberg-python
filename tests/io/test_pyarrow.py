@@ -15,15 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=protected-access,unused-argument,redefined-outer-name
+import json
 import logging
 import os
+import struct
 import sys
 import tempfile
 import uuid
 import warnings
+import zlib
 from collections.abc import Iterator
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -36,6 +40,7 @@ import pyarrow.parquet as pq
 import pytest
 from packaging import version
 from pyarrow.fs import AwsDefaultS3RetryStrategy, FileType, LocalFileSystem, S3FileSystem
+from pyroaring import BitMap
 
 from pyiceberg.exceptions import ResolveError
 from pyiceberg.expressions import (
@@ -58,8 +63,14 @@ from pyiceberg.expressions import (
     BoundNotStartsWith,
     BoundReference,
     BoundStartsWith,
+    EqualTo,
     GreaterThan,
+    GreaterThanOrEqual,
+    In,
+    IsNull,
     Not,
+    NotEqualTo,
+    NotNull,
     Or,
 )
 from pyiceberg.expressions.literals import literal
@@ -68,6 +79,7 @@ from pyiceberg.io.pyarrow import (
     ICEBERG_SCHEMA,
     PYARROW_PARQUET_FIELD_ID_KEY,
     ArrowScan,
+    GeospatialStatsAggregator,
     PyArrowFile,
     PyArrowFileIO,
     StatsAggregator,
@@ -75,6 +87,8 @@ from pyiceberg.io.pyarrow import (
     _ConvertToArrowSchema,
     _determine_partitions,
     _primitive_to_physical,
+    _pyarrow_to_schema_without_ids,
+    _read_all_delete_files,
     _read_deletes,
     _task_to_record_batches,
     _to_requested_schema,
@@ -84,15 +98,23 @@ from pyiceberg.io.pyarrow import (
     data_file_statistics_from_parquet_metadata,
     expression_to_pyarrow,
     parquet_path_to_id_mapping,
+    pyarrow_to_schema,
     schema_to_pyarrow,
     write_file,
 )
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema, make_compatible_name, visit
-from pyiceberg.table import FileScanTask, TableProperties, WriteTask
+from pyiceberg.table import FileScanTask, Table, TableProperties, WriteTask
+from pyiceberg.table.deletion_vector import (
+    _DV_BLOB_MAGIC_NUMBER,
+    PROPERTY_REFERENCED_DATA_FILE,
+    deletion_vectors_from_puffin_file,
+)
 from pyiceberg.table.metadata import TableMetadataV2
+from pyiceberg.table.metadata_columns import LAST_UPDATED_SEQUENCE_NUMBER, ROW_ID
 from pyiceberg.table.name_mapping import create_mapping_from_schema
+from pyiceberg.table.puffin import MAGIC_BYTES, PuffinFile
 from pyiceberg.transforms import HourTransform, IdentityTransform
 from pyiceberg.typedef import UTF8, Properties, Record, TableVersion
 from pyiceberg.types import (
@@ -115,9 +137,13 @@ from pyiceberg.types import (
     StructType,
     TimestampNanoType,
     TimestampType,
+    TimestamptzNanoType,
     TimestamptzType,
     TimeType,
+    UnknownType,
+    VariantType,
 )
+from pyiceberg.utils.geo import GeospatialBound
 from tests.catalog.test_base import InMemoryCatalog
 from tests.conftest import UNIFIED_AWS_SESSION_PROPERTIES
 
@@ -1160,6 +1186,290 @@ def project(
     )
 
 
+WKB_POINT_1_2 = bytes.fromhex("0101000000000000000000f03f0000000000000040")
+WKB_POINT_3_4 = bytes.fromhex("010100000000000000000008400000000000001040")
+GEO_TABLE_SCHEMA = Schema(
+    NestedField(1, "id", IntegerType(), required=True),
+    NestedField(2, "geom", GeometryType("srid:3857"), required=False),
+    NestedField(3, "geog", GeographyType("srid:4326", "vincenty"), required=False),
+)
+
+
+def _geo_parquet_file(tmp_path: Path, geom: pa.Array, geog: pa.Array) -> str:
+    """Write a Parquet file with geo columns the way another engine would, with field ids but no Iceberg schema."""
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),
+            pa.field("geom", geom.type, nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "2"}),
+            pa.field("geog", geog.type, nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "3"}),
+        ]
+    )
+    table = pa.Table.from_arrays([pa.array([1, 2, 3], pa.int32()), geom, geog], schema=arrow_schema)
+    return _write_table_to_file(str(tmp_path / "geo.parquet"), arrow_schema, table)
+
+
+def _assert_geo_result(result: pa.Table, expected_types: tuple[pa.DataType, pa.DataType]) -> None:
+    assert result.column("id").to_pylist() == [1, 2, 3]
+    assert result.schema.field("geom").type == expected_types[0]
+    assert result.schema.field("geog").type == expected_types[1]
+    for name in ("geom", "geog"):
+        column = result.column(name)
+        storage = column.cast(column.type.storage_type) if isinstance(column.type, pa.ExtensionType) else column
+        assert storage.to_pylist() == [WKB_POINT_1_2, None, WKB_POINT_3_4]
+
+
+@pytest.mark.parametrize("binary_type", [pa.binary(), pa.large_binary()])
+def test_projection_geo_from_plain_binary(tmp_path: Path, binary_type: pa.DataType) -> None:
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], binary_type)
+    file = _geo_parquet_file(tmp_path, values, values)
+    result = project(GEO_TABLE_SCHEMA, [file])
+    _assert_geo_result(
+        result,
+        (schema_to_pyarrow(GeometryType("srid:3857")), schema_to_pyarrow(GeographyType("srid:4326", "vincenty"))),
+    )
+
+
+def test_projection_geo_from_plain_binary_without_geoarrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], pa.binary())
+    file = _geo_parquet_file(tmp_path, values, values)
+    # Importing a module set to None raises ImportError, as if geoarrow-pyarrow was not installed
+    monkeypatch.setitem(sys.modules, "geoarrow.pyarrow", None)
+    result = project(GEO_TABLE_SCHEMA, [file])
+    _assert_geo_result(result, (pa.large_binary(), pa.large_binary()))
+
+
+def test_projection_geo_from_geoarrow(tmp_path: Path) -> None:
+    ga = pytest.importorskip("geoarrow.pyarrow")
+    wkb = ga.as_wkb(pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], pa.binary()))
+    geom_type = ga.wkb().with_crs("srid:3857")
+    # The PyArrow Parquet writer only supports planar and spherical edges
+    geog_type = ga.wkb().with_crs("srid:4326").with_edge_type(ga.EdgeType.SPHERICAL)
+    geom = pa.ExtensionArray.from_storage(geom_type, wkb.storage)
+    geog = pa.ExtensionArray.from_storage(geog_type, wkb.storage)
+    file = _geo_parquet_file(tmp_path, geom, geog)
+    table_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "geom", GeometryType("srid:3857"), required=False),
+        NestedField(3, "geog", GeographyType("srid:4326"), required=False),
+    )
+    result = project(table_schema, [file])
+    _assert_geo_result(result, (geom_type, geog_type))
+
+
+@pytest.mark.parametrize(
+    "expr, expected_ids",
+    [
+        (EqualTo("geom", WKB_POINT_3_4), [3]),
+        (NotEqualTo("geog", WKB_POINT_3_4), [1]),
+        (In("geom", {WKB_POINT_1_2, WKB_POINT_3_4}), [1, 3]),
+        (IsNull("geom"), [2]),
+        (NotNull("geog"), [1, 3]),
+    ],
+)
+def test_projection_geo_equality_filter(tmp_path: Path, expr: BooleanExpression, expected_ids: list[int]) -> None:
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], pa.binary())
+    file = _geo_parquet_file(tmp_path, values, values)
+    assert project(GEO_TABLE_SCHEMA, [file], expr=expr).column("id").to_pylist() == expected_ids
+
+
+def test_projection_geo_filter_on_other_column(tmp_path: Path) -> None:
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_3_4], pa.binary())
+    file = _geo_parquet_file(tmp_path, values, values)
+    result = project(GEO_TABLE_SCHEMA, [file], expr=GreaterThan("id", 1))
+    assert result.column("id").to_pylist() == [2, 3]
+    geom = result.column("geom")
+    storage = geom.cast(geom.type.storage_type) if isinstance(geom.type, pa.ExtensionType) else geom
+    assert storage.to_pylist() == [None, WKB_POINT_3_4]
+
+
+def _v3_table(tmp_path: Path, schema: Schema, name: str = "tbl") -> Table:
+    from pyiceberg.catalog.memory import InMemoryCatalog as MemoryCatalog
+
+    memory_catalog = MemoryCatalog("memory", warehouse=f"file://{tmp_path}")
+    memory_catalog.create_namespace("default")
+    return memory_catalog.create_table(f"default.{name}", schema, properties={"format-version": "3"})
+
+
+def _wkb_storage(column: pa.ChunkedArray) -> list[Any]:
+    storage = column.cast(column.type.storage_type) if isinstance(column.type, pa.ExtensionType) else column
+    return storage.to_pylist()
+
+
+WKB_POINT_NEG = struct.pack("<BIdd", 1, 1, -3.0, 5.0)
+GEO_WRITE_SCHEMA = Schema(
+    NestedField(1, "id", IntegerType(), required=False),
+    NestedField(2, "geom", GeometryType("srid:3857"), required=False),
+    NestedField(3, "geom_default", GeometryType(), required=False),
+    NestedField(4, "geog", GeographyType("srid:4326"), required=False),
+)
+
+
+@pytest.mark.parametrize("binary_type", [pa.binary(), pa.large_binary()])
+def test_write_geo_from_plain_binary(tmp_path: Path, binary_type: pa.DataType) -> None:
+    pytest.importorskip("geoarrow.pyarrow")
+    tbl = _v3_table(tmp_path, GEO_WRITE_SCHEMA)
+    values = pa.array([WKB_POINT_1_2, None, WKB_POINT_NEG], binary_type)
+    tbl.append(pa.table({"id": pa.array([1, 2, 3], pa.int32()), "geom": values, "geom_default": values, "geog": values}))
+
+    result = tbl.scan().to_arrow()
+    for name in ("geom", "geom_default", "geog"):
+        assert _wkb_storage(result.column(name)) == [WKB_POINT_1_2, None, WKB_POINT_NEG]
+
+    (data_file,) = [task.file for task in tbl.scan().plan_files()]
+    parquet_schema = str(pq.ParquetFile(data_file.file_path.removeprefix("file://")).schema)
+    assert "field_id=2 geom (Geometry(crs=srid:3857))" in parquet_schema
+    # The default CRS OGC:CRS84 is written as an empty CRS
+    assert "field_id=3 geom_default (Geometry(crs=))" in parquet_schema
+    assert "field_id=4 geog (Geography(crs=srid:4326, algorithm=spherical))" in parquet_schema
+
+    # Geometry bounds are the corners of the bounding box
+    for field_id in (2, 3):
+        assert GeospatialBound.from_bytes(data_file.lower_bounds[field_id]) == GeospatialBound(-3.0, 2.0)
+        assert GeospatialBound.from_bytes(data_file.upper_bounds[field_id]) == GeospatialBound(1.0, 5.0)
+    assert data_file.value_counts[2] == 3
+
+    readable_metrics = tbl.inspect.files().to_pylist()[0]["readable_metrics"]
+    assert GeospatialBound.from_bytes(readable_metrics["geom"]["lower_bound"]) == GeospatialBound(-3.0, 2.0)
+    assert readable_metrics["geom"]["value_count"] == 3
+
+
+def test_write_geo_from_geoarrow(tmp_path: Path) -> None:
+    ga = pytest.importorskip("geoarrow.pyarrow")
+    tbl = _v3_table(tmp_path, GEO_WRITE_SCHEMA)
+    wkb = pa.array([WKB_POINT_1_2, WKB_POINT_NEG], pa.binary())
+    geom = pa.ExtensionArray.from_storage(ga.wkb().with_crs("srid:3857"), wkb)
+    geom_default = pa.ExtensionArray.from_storage(ga.wkb(), wkb)
+    geog = pa.ExtensionArray.from_storage(ga.wkb().with_crs("srid:4326").with_edge_type(ga.EdgeType.SPHERICAL), wkb)
+    ids = pa.array([1, 2], pa.int32())
+
+    # A GeoArrow CRS that differs from the table CRS is a type mismatch
+    with pytest.raises(ValueError, match="Mismatch in fields"):
+        tbl.append(pa.table({"id": ids, "geom": geom_default, "geom_default": geom_default, "geog": geog}))
+
+    tbl.append(pa.table({"id": ids, "geom": geom, "geom_default": geom_default, "geog": geog}))
+
+    result = tbl.scan().to_arrow()
+    assert result.schema.field("geom").type == schema_to_pyarrow(GeometryType("srid:3857"))
+    for name in ("geom", "geom_default", "geog"):
+        assert _wkb_storage(result.column(name)) == [WKB_POINT_1_2, WKB_POINT_NEG]
+
+
+def test_write_geography_unsupported_edges_as_plain_binary(tmp_path: Path) -> None:
+    pytest.importorskip("geoarrow.pyarrow")
+    schema = Schema(NestedField(1, "geog", GeographyType("srid:4326", "vincenty"), required=False))
+    tbl = _v3_table(tmp_path, schema)
+    with pytest.warns(UserWarning, match="vincenty edge algorithm as plain WKB binary"):
+        tbl.append(pa.table({"geog": pa.array([WKB_POINT_1_2], pa.binary())}))
+
+    assert _wkb_storage(tbl.scan().to_arrow().column("geog")) == [WKB_POINT_1_2]
+    (data_file,) = [task.file for task in tbl.scan().plan_files()]
+    parquet_schema = str(pq.ParquetFile(data_file.file_path.removeprefix("file://")).schema)
+    assert "field_id=1 geog;" in parquet_schema
+    assert not data_file.lower_bounds
+
+
+def test_write_geo_without_geoarrow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tbl = _v3_table(tmp_path, GEO_WRITE_SCHEMA)
+    # Importing a module set to None raises ImportError, as if geoarrow-pyarrow was not installed
+    monkeypatch.setitem(sys.modules, "geoarrow.pyarrow", None)
+    values = pa.array([WKB_POINT_1_2, None], pa.binary())
+    with pytest.warns(UserWarning, match="install pyiceberg\\[geoarrow\\]"):
+        tbl.append(pa.table({"id": pa.array([1, 2], pa.int32()), "geom": values, "geom_default": values, "geog": values}))
+
+    result = tbl.scan().to_arrow()
+    assert result.schema.field("geom").type == pa.large_binary()
+    assert result.column("geom").to_pylist() == [WKB_POINT_1_2, None]
+    (data_file,) = [task.file for task in tbl.scan().plan_files()]
+    # Lexicographic min/max of WKB are not geo bounds, so they are not recorded
+    assert 2 not in data_file.lower_bounds and 2 not in data_file.upper_bounds
+    assert data_file.null_value_counts[2] == 1
+
+
+def test_add_files_geo_bounds_from_parquet_statistics(tmp_path: Path) -> None:
+    ga = pytest.importorskip("geoarrow.pyarrow")
+    tbl = _v3_table(tmp_path, Schema(NestedField(1, "geom", GeometryType(), required=False)))
+    points = [struct.pack("<BIddd", 1, 1001, 1.0, 2.0, 3.0), struct.pack("<BIddd", 1, 1001, -1.0, 4.0, 5.0)]
+    geom = pa.ExtensionArray.from_storage(ga.wkb(), pa.array(points, pa.binary()))
+    arrow_schema = pa.schema([pa.field("geom", geom.type, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"})])
+    file_path = str(tmp_path / "geo_xyz.parquet")
+    pq.write_table(pa.Table.from_arrays([geom], schema=arrow_schema), file_path)
+    if not pq.ParquetFile(file_path).metadata.row_group(0).column(0).is_geo_stats_set:
+        pytest.skip("PyArrow does not write Parquet geospatial statistics")
+
+    tbl.add_files([file_path])
+
+    (data_file,) = [task.file for task in tbl.scan().plan_files()]
+    assert GeospatialBound.from_bytes(data_file.lower_bounds[1]) == GeospatialBound(-1.0, 2.0, 3.0)
+    assert GeospatialBound.from_bytes(data_file.upper_bounds[1]) == GeospatialBound(1.0, 4.0, 5.0)
+
+
+def _geo_statistics(**box: float) -> SimpleNamespace:
+    """Stand-in for the pyarrow GeoStatistics of a row group."""
+    return SimpleNamespace(**{key: box.get(key) for key in ("xmin", "ymin", "zmin", "mmin", "xmax", "ymax", "zmax", "mmax")})
+
+
+def test_geography_bounds_wrapping_antimeridian_are_omitted() -> None:
+    aggregator = GeospatialStatsAggregator(GeographyType())
+    aggregator.update_box(_geo_statistics(xmin=170.0, ymin=-10.0, xmax=-170.0, ymax=10.0))
+    assert aggregator.min_as_bytes() is None and aggregator.max_as_bytes() is None
+
+    aggregator = GeospatialStatsAggregator(GeographyType())
+    aggregator.update_box(_geo_statistics(xmin=-170.0, ymin=-10.0, xmax=170.0, ymax=10.0))
+    assert aggregator.min_as_bytes() == GeospatialBound(-170.0, -10.0).to_bytes()
+
+
+def test_geo_bounds_merge_row_groups() -> None:
+    aggregator = GeospatialStatsAggregator(GeometryType())
+    aggregator.update_box(_geo_statistics(xmin=0.0, ymin=0.0, xmax=1.0, ymax=1.0, zmin=5.0, zmax=6.0))
+    aggregator.update_box(_geo_statistics(xmin=-1.0, ymin=0.5, xmax=0.5, ymax=2.0))
+    # Z is only kept when every row group has it
+    assert aggregator.min_as_bytes() == GeospatialBound(-1.0, 0.0).to_bytes()
+    assert aggregator.max_as_bytes() == GeospatialBound(1.0, 2.0).to_bytes()
+
+    # A row group without a bounding box (e.g. only nulls) invalidates the bounds
+    aggregator.update_box(None)
+    assert aggregator.min_as_bytes() is None
+
+
+def test_write_default_fills_missing_column(tmp_path: Path) -> None:
+    tbl = _v3_table(tmp_path, Schema(NestedField(1, "id", IntegerType(), required=False)))
+    tbl.append(pa.table({"id": pa.array([1], pa.int32())}))
+    with tbl.update_schema() as update:
+        update.add_column("color", StringType(), required=True, default_value="blue")
+    with tbl.update_schema() as update:
+        update.set_default_value("color", "green")
+
+    # The required column is missing from the dataframe, which is allowed because it has a write-default
+    tbl.append(pa.table({"id": pa.array([2], pa.int32())}))
+
+    result = tbl.scan().to_arrow().sort_by("id")
+    # Rows written before the column existed read the initial-default, new rows were written with the write-default
+    assert result.column("color").to_pylist() == ["blue", "green"]
+
+
+@pytest.mark.parametrize("read_type, unit", [(TimestampType(), "us"), (TimestampNanoType(), "ns")])
+def test_projection_date_promoted_to_timestamp(tmp_path: Path, read_type: PrimitiveType, unit: str) -> None:
+    arrow_schema = pa.schema([pa.field("d", pa.date32(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"})])
+    file = _write_table_to_file(
+        str(tmp_path / "date.parquet"), arrow_schema, pa.table({"d": [date(2024, 1, 2), None]}, schema=arrow_schema)
+    )
+    result = project(Schema(NestedField(1, "d", read_type, required=False)), [file])
+    assert result.schema.field("d").type == pa.timestamp(unit)
+    assert result.column("d").to_pylist() == [datetime(2024, 1, 2), None]
+
+
+def test_unknown_columns_are_not_written(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=False), NestedField(2, "u", UnknownType(), required=False))
+    tbl = _v3_table(tmp_path, schema)
+    tbl.append(pa.table({"id": pa.array([1], pa.int32())}))
+    tbl.append(pa.table({"id": pa.array([2], pa.int32()), "u": pa.nulls(1)}))
+
+    result = tbl.scan().to_arrow().sort_by("id")
+    assert result.column("u").to_pylist() == [None, None]
+    for task in tbl.scan().plan_files():
+        assert pq.ParquetFile(task.file.file_path.removeprefix("file://")).schema_arrow.names == ["id"]
+
+
 def test_projection_add_column(file_int: str) -> None:
     schema = Schema(
         # All new IDs
@@ -1822,6 +2132,193 @@ def test_read_deletes(deletes_file: str, request: pytest.FixtureRequest) -> None
     assert list(deletes.values())[0] == pa.chunked_array([[1, 3, 5]])
 
 
+def _deletion_vector_bitmap_payload(values: list[int] | None = None) -> bytes:
+    return (1).to_bytes(8, byteorder="little") + (0).to_bytes(4, byteorder="little") + BitMap(values or [1, 3, 5]).serialize()
+
+
+def _deletion_vector_blob(bitmap_payload: bytes) -> bytes:
+    bitmap_data = struct.pack("<I", _DV_BLOB_MAGIC_NUMBER) + bitmap_payload
+    return struct.pack(">I", len(bitmap_data)) + bitmap_data + struct.pack(">I", zlib.crc32(bitmap_data) & 0xFFFFFFFF)
+
+
+def _deletion_vector_puffin_payload(referenced_data_file: str) -> bytes:
+    dv_blob = _deletion_vector_blob(_deletion_vector_bitmap_payload())
+    footer_payload = json.dumps(
+        {
+            "blobs": [
+                {
+                    "type": "deletion-vector-v1",
+                    "fields": [2147483546],
+                    "snapshot-id": 1,
+                    "sequence-number": 1,
+                    "offset": len(MAGIC_BYTES) + 4,
+                    "length": len(dv_blob),
+                    "properties": {PROPERTY_REFERENCED_DATA_FILE: referenced_data_file},
+                }
+            ],
+            "properties": {},
+        }
+    ).encode()
+
+    return (
+        MAGIC_BYTES
+        + b"\x00\x00\x00\x00"
+        + dv_blob
+        + footer_payload
+        + len(footer_payload).to_bytes(4, byteorder="little")
+        + b"\x00\x00\x00\x00"
+        + MAGIC_BYTES
+    )
+
+
+def test_deletion_vectors_from_puffin_file(tmp_path: Path) -> None:
+    referenced_data_file = f"{tmp_path}/data.parquet"
+    puffin_payload = _deletion_vector_puffin_payload(referenced_data_file)
+    delete_file_path = f"{tmp_path}/deletes.puffin"
+
+    with open(delete_file_path, "wb") as f:
+        f.write(puffin_payload)
+
+    with open(delete_file_path, "rb") as f:
+        deletion_vectors = deletion_vectors_from_puffin_file(PuffinFile(f.read()))
+
+    assert {dv.referenced_data_file: dv.to_vector() for dv in deletion_vectors} == {
+        referenced_data_file: pa.chunked_array([[1, 3, 5]])
+    }
+
+
+def test_read_deletes_from_whole_puffin_file(tmp_path: Path) -> None:
+    referenced_data_file = f"{tmp_path}/data.parquet"
+    delete_file_path = f"{tmp_path}/deletes.puffin"
+
+    with open(delete_file_path, "wb") as f:
+        f.write(_deletion_vector_puffin_payload(referenced_data_file))
+
+    deletes = _read_deletes(
+        PyArrowFileIO(),
+        DataFile.from_args(
+            _table_format_version=3,
+            content=DataFileContent.POSITION_DELETES,
+            file_path=delete_file_path,
+            file_format=FileFormat.PUFFIN,
+            record_count=3,
+        ),
+    )
+
+    assert deletes == {referenced_data_file: pa.chunked_array([[1, 3, 5]])}
+
+
+def test_read_deletion_vector_blob_from_content_range(tmp_path: Path) -> None:
+    referenced_data_file = f"{tmp_path}/data.parquet"
+    dv_blob = _deletion_vector_blob(_deletion_vector_bitmap_payload())
+    prefix = b"\x01not-a-puffin-file"
+    delete_file_path = f"{tmp_path}/deletes.bin"
+
+    with open(delete_file_path, "wb") as f:
+        f.write(prefix + dv_blob + b"trailing-bytes")
+
+    deletes = _read_deletes(
+        PyArrowFileIO(),
+        DataFile.from_args(
+            _table_format_version=3,
+            content=DataFileContent.POSITION_DELETES,
+            file_path=delete_file_path,
+            file_format=FileFormat.PUFFIN,
+            record_count=3,
+            referenced_data_file=referenced_data_file,
+            content_offset=len(prefix),
+            content_size_in_bytes=len(dv_blob),
+        ),
+    )
+
+    assert deletes == {referenced_data_file: pa.chunked_array([[1, 3, 5]])}
+
+
+def test_read_all_delete_files_keeps_multiple_dv_content_ranges_for_same_path(tmp_path: Path) -> None:
+    referenced_data_file = f"{tmp_path}/data.parquet"
+    first_dv_blob = _deletion_vector_blob(_deletion_vector_bitmap_payload([1, 3]))
+    second_dv_blob = _deletion_vector_blob(_deletion_vector_bitmap_payload([5]))
+    delete_file_path = f"{tmp_path}/deletes.bin"
+
+    with open(delete_file_path, "wb") as f:
+        f.write(first_dv_blob + second_dv_blob)
+
+    first_dv = DataFile.from_args(
+        _table_format_version=3,
+        content=DataFileContent.POSITION_DELETES,
+        file_path=delete_file_path,
+        file_format=FileFormat.PUFFIN,
+        record_count=2,
+        referenced_data_file=referenced_data_file,
+        content_offset=0,
+        content_size_in_bytes=len(first_dv_blob),
+    )
+    second_dv = DataFile.from_args(
+        _table_format_version=3,
+        content=DataFileContent.POSITION_DELETES,
+        file_path=delete_file_path,
+        file_format=FileFormat.PUFFIN,
+        record_count=1,
+        referenced_data_file=referenced_data_file,
+        content_offset=len(first_dv_blob),
+        content_size_in_bytes=len(second_dv_blob),
+    )
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=referenced_data_file,
+        file_format=FileFormat.PARQUET,
+        record_count=10,
+        file_size_in_bytes=100,
+    )
+
+    deletes = _read_all_delete_files(
+        PyArrowFileIO(),
+        [FileScanTask(data_file=data_file, delete_files=[first_dv, second_dv])],
+    )
+
+    assert sorted(delete.to_pylist() for delete in deletes[referenced_data_file]) == [[1, 3], [5]]
+
+
+def test_read_all_delete_files_applies_delete_files_only_to_planned_data_files(tmp_path: Path) -> None:
+    data_a, data_b = f"{tmp_path}/a.parquet", f"{tmp_path}/b.parquet"
+    position_deletes_path = f"{tmp_path}/pos-deletes.parquet"
+    pq.write_table(pa.table({"file_path": [data_a, data_b], "pos": [0, 1]}), position_deletes_path)
+    position_deletes = DataFile.from_args(
+        content=DataFileContent.POSITION_DELETES, file_path=position_deletes_path, file_format=FileFormat.PARQUET
+    )
+
+    dv_blob = _deletion_vector_blob(_deletion_vector_bitmap_payload([2]))
+    dv_path = f"{tmp_path}/deletes.puffin"
+    with open(dv_path, "wb") as f:
+        f.write(dv_blob)
+    dv = DataFile.from_args(
+        _table_format_version=3,
+        content=DataFileContent.POSITION_DELETES,
+        file_path=dv_path,
+        file_format=FileFormat.PUFFIN,
+        record_count=1,
+        referenced_data_file=data_a,
+        content_offset=0,
+        content_size_in_bytes=len(dv_blob),
+    )
+
+    def data_file(path: str) -> DataFile:
+        return DataFile.from_args(
+            content=DataFileContent.DATA, file_path=path, file_format=FileFormat.PARQUET, record_count=10, file_size_in_bytes=1
+        )
+
+    # The DV supersedes the position delete file for a.parquet, which still applies to b.parquet
+    deletes = _read_all_delete_files(
+        PyArrowFileIO(),
+        [
+            FileScanTask(data_file=data_file(data_a), delete_files=[dv]),
+            FileScanTask(data_file=data_file(data_b), delete_files=[position_deletes]),
+        ],
+    )
+
+    assert {path: [arr.to_pylist() for arr in arrays] for path, arrays in deletes.items()} == {data_a: [[2]], data_b: [[1]]}
+
+
 def test_delete(deletes_file: str, request: pytest.FixtureRequest, table_schema_simple: Schema) -> None:
     # Determine file format from the file extension
     file_format = FileFormat.PARQUET if deletes_file.endswith(".parquet") else FileFormat.ORC
@@ -1865,6 +2362,121 @@ bar: [[1,3]]
 baz: [[true,null]]"""
 
     assert str(with_deletes) == expected_str
+
+
+_ROW_LINEAGE_TABLE_SCHEMA = Schema(NestedField(1, "id", LongType(), required=False), schema_id=0)
+
+
+def _row_lineage_scan(
+    tmp_path: Path,
+    first_row_id: int | None,
+    sequence_number: int | None,
+    deleted_positions: list[int] | None = None,
+    stored_lineage: dict[str, list[int | None]] | None = None,
+    row_filter: BooleanExpression | None = None,
+) -> tuple[ArrowScan, FileScanTask]:
+    """Write a data file with ids 0..4 and return a scan projecting ``id`` and the row lineage columns."""
+    columns: dict[str, pa.Array] = {
+        "id": pa.array(range(5), type=pa.int64()),
+    }
+    fields = [pa.field("id", pa.int64(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"})]
+    for column, field in ((ROW_ID.name, ROW_ID), (LAST_UPDATED_SEQUENCE_NUMBER.name, LAST_UPDATED_SEQUENCE_NUMBER)):
+        if stored_lineage and column in stored_lineage:
+            columns[column] = pa.array(stored_lineage[column], type=pa.int64())
+            fields.append(pa.field(column, pa.int64(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: str(field.field_id)}))
+    data_file_path = str(tmp_path / "data.parquet")
+    pq.write_table(pa.Table.from_pydict(columns, schema=pa.schema(fields)), data_file_path)
+
+    data_file = DataFile.from_args(
+        _table_format_version=3,
+        content=DataFileContent.DATA,
+        file_path=data_file_path,
+        file_format=FileFormat.PARQUET,
+        partition=Record(),
+        record_count=5,
+        file_size_in_bytes=os.path.getsize(data_file_path),
+        first_row_id=first_row_id,
+    )
+    data_file.spec_id = 0
+
+    delete_files = []
+    if deleted_positions:
+        deletes_path = str(tmp_path / "deletes.parquet")
+        pq.write_table(pa.table({"file_path": [data_file_path] * len(deleted_positions), "pos": deleted_positions}), deletes_path)
+        delete_files.append(
+            DataFile.from_args(content=DataFileContent.POSITION_DELETES, file_path=deletes_path, file_format=FileFormat.PARQUET)
+        )
+
+    task = FileScanTask(data_file=data_file, delete_files=delete_files, sequence_number=sequence_number)
+    scan = ArrowScan(
+        table_metadata=TableMetadataV2(
+            location="file://a/b/c.json",
+            last_column_id=1,
+            format_version=2,
+            current_schema_id=0,
+            schemas=[_ROW_LINEAGE_TABLE_SCHEMA],
+            partition_specs=[PartitionSpec()],
+        ),
+        io=PyArrowFileIO(),
+        projected_schema=Schema(*_ROW_LINEAGE_TABLE_SCHEMA.fields, ROW_ID, LAST_UPDATED_SEQUENCE_NUMBER),
+        row_filter=row_filter if row_filter is not None else AlwaysTrue(),
+    )
+    return scan, task
+
+
+def test_row_lineage_inherited_with_positional_deletes(tmp_path: Path) -> None:
+    scan, task = _row_lineage_scan(tmp_path, first_row_id=10, sequence_number=5, deleted_positions=[1])
+
+    result = scan.to_table([task])
+
+    assert result.schema.names == ["id", "_row_id", "_last_updated_sequence_number"]
+    assert result.schema.field("_row_id").type == pa.int64()
+    assert result.to_pydict() == {
+        "id": [0, 2, 3, 4],
+        "_row_id": [10, 12, 13, 14],
+        "_last_updated_sequence_number": [5, 5, 5, 5],
+    }
+    batches = list(scan.to_record_batches([task]))
+    assert pa.Table.from_batches(batches).to_pydict() == result.to_pydict()
+
+
+def test_row_lineage_positions_survive_row_filter(tmp_path: Path) -> None:
+    scan, task = _row_lineage_scan(tmp_path, first_row_id=10, sequence_number=5, row_filter=GreaterThanOrEqual("id", 3))
+    assert scan.to_table([task]).to_pydict() == {"id": [3, 4], "_row_id": [13, 14], "_last_updated_sequence_number": [5, 5]}
+
+    scan, task = _row_lineage_scan(
+        tmp_path, first_row_id=10, sequence_number=5, deleted_positions=[3], row_filter=GreaterThanOrEqual("id", 2)
+    )
+    assert scan.to_table([task]).to_pydict() == {"id": [2, 4], "_row_id": [12, 14], "_last_updated_sequence_number": [5, 5]}
+
+
+def test_row_lineage_null_without_first_row_id(tmp_path: Path) -> None:
+    scan, task = _row_lineage_scan(tmp_path, first_row_id=None, sequence_number=5, deleted_positions=[1])
+
+    assert scan.to_table([task]).to_pydict() == {
+        "id": [0, 2, 3, 4],
+        "_row_id": [None, None, None, None],
+        "_last_updated_sequence_number": [None, None, None, None],
+    }
+
+
+def test_row_lineage_keeps_values_stored_in_data_file(tmp_path: Path) -> None:
+    scan, task = _row_lineage_scan(
+        tmp_path,
+        first_row_id=10,
+        sequence_number=5,
+        deleted_positions=[1],
+        stored_lineage={
+            "_row_id": [100, None, 102, None, 104],
+            "_last_updated_sequence_number": [2, None, 3, None, None],
+        },
+    )
+
+    assert scan.to_table([task]).to_pydict() == {
+        "id": [0, 2, 3, 4],
+        "_row_id": [100, 102, 13, 104],
+        "_last_updated_sequence_number": [2, 3, 5, 5],
+    }
 
 
 def test_delete_duplicates(deletes_file: str, request: pytest.FixtureRequest, table_schema_simple: Schema) -> None:
@@ -3392,6 +4004,39 @@ def test_task_to_record_batches_nanos(format_version: TableVersion, tmpdir: str)
     assert _expected_batch("ns" if format_version > 2 else "us").equals(actual_result)
 
 
+@pytest.mark.parametrize(
+    "iceberg_type, tz",
+    [(TimestampNanoType(), None), (TimestamptzNanoType(), "UTC")],
+)
+def test_task_to_record_batches_micros_file_for_nanos_table(iceberg_type: PrimitiveType, tz: str | None, tmpdir: str) -> None:
+    # A file written with downcast-ns-timestamp-to-us-on-write stores microseconds for a nanosecond column
+    arrow_type = pa.timestamp("us", tz=tz)
+    arrow_table = pa.table(
+        [pa.array([1755172800000000, 1755176400000001], type=arrow_type)],
+        pa.schema((pa.field("ts_field", arrow_type, nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),)),
+    )
+    data_file = _write_table_to_data_file(f"{tmpdir}/test_micros_file_for_nanos_table.parquet", arrow_table.schema, arrow_table)
+    table_schema = Schema(NestedField(1, "ts_field", iceberg_type, required=False))
+    zone = "+00:00" if tz else ""
+
+    actual_result = list(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=GreaterThanOrEqual("ts_field", f"2025-08-14T13:00:00{zone}").bind(table_schema),
+            projected_schema=table_schema,
+            table_schema=table_schema,
+            projected_field_ids={1},
+            positional_deletes=None,
+            case_sensitive=True,
+            format_version=3,
+        )
+    )[0]
+
+    expected = pa.record_batch([pa.array([1755176400000001000], type=pa.timestamp("ns", tz=tz))], names=["ts_field"])
+    assert expected.equals(actual_result)
+
+
 def test_task_to_record_batches_scanner_filter_not_set_with_positional_deletes(tmpdir: str) -> None:
     """Regression test for https://github.com/apache/iceberg-python/issues/3272.
 
@@ -3514,6 +4159,391 @@ def test_task_to_record_batches_filter_after_positional_deletes_empty_result(tmp
     )
 
     assert result_batches == []
+
+
+def _write_equality_delete_file(filepath: str, table: pa.Table, equality_ids: list[int]) -> DataFile:
+    _write_table_to_file(filepath, table.schema, table)
+    return DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=filepath,
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=len(table),
+        file_size_in_bytes=22,
+        equality_ids=equality_ids,
+    )
+
+
+def _id_name_file(tmpdir: str) -> tuple[DataFile, Schema]:
+    arrow_schema = pa.schema(
+        (
+            pa.field("id", pa.int32(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),
+            pa.field("name", pa.string(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "2"}),
+        )
+    )
+    arrow_table = pa.table(
+        [pa.array([1, 2, 3, 4, None, 6], type=pa.int32()), pa.array(["a", "b", None, "d", "e", None])], schema=arrow_schema
+    )
+    data_file = _write_table_to_data_file(f"{tmpdir}/eq_data.parquet", arrow_schema, arrow_table)
+    table_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+        NestedField(2, "name", StringType(), required=False),
+    )
+    return data_file, table_schema
+
+
+def test_read_equality_deletes_projects_delete_columns(tmpdir: str) -> None:
+    from pyiceberg.io.pyarrow import _read_equality_deletes
+
+    delete_schema = pa.schema(
+        (
+            pa.field("id", pa.int64(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),
+            pa.field("extra", pa.string(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "3"}),
+        )
+    )
+    delete_file = _write_equality_delete_file(
+        f"{tmpdir}/eq_deletes.parquet", pa.table([pa.array([2, None]), pa.array(["x", "y"])], schema=delete_schema), [1]
+    )
+
+    deletes = _read_equality_deletes(PyArrowFileIO(), delete_file)
+
+    assert deletes.field_ids == (1,)
+    # columns that are not delete columns are ignored
+    assert deletes.rows.column_names == ["1"]
+    assert deletes.rows.column("1").to_pylist() == [2, None]
+
+
+def test_read_equality_deletes_missing_delete_column(tmpdir: str) -> None:
+    from pyiceberg.io.pyarrow import _read_equality_deletes
+
+    delete_schema = pa.schema((pa.field("id", pa.int32(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),))
+    delete_file = _write_equality_delete_file(
+        f"{tmpdir}/eq_deletes.parquet", pa.table([pa.array([2], type=pa.int32())], schema=delete_schema), [1, 2]
+    )
+
+    with pytest.raises(ValueError, match="missing the delete column with id 2"):
+        _read_equality_deletes(PyArrowFileIO(), delete_file)
+
+
+def test_task_to_record_batches_equality_deletes_single_column(tmpdir: str) -> None:
+    from pyiceberg.io.pyarrow import _read_equality_deletes
+
+    data_file, table_schema = _id_name_file(tmpdir)
+    # a long delete column matches the int data column; the null delete row deletes the row with a null id
+    delete_schema = pa.schema((pa.field("id", pa.int64(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),))
+    delete_file = _write_equality_delete_file(
+        f"{tmpdir}/eq_deletes.parquet", pa.table([pa.array([2, 4, None, 100])], schema=delete_schema), [1]
+    )
+    deletes = _read_equality_deletes(PyArrowFileIO(), delete_file)
+
+    result = pa.Table.from_batches(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file, delete_files=[delete_file]),
+            bound_row_filter=AlwaysTrue(),
+            projected_schema=table_schema.select("name"),
+            table_schema=table_schema,
+            projected_field_ids={2},
+            positional_deletes=None,
+            case_sensitive=True,
+            equality_deletes=[deletes],
+        )
+    )
+
+    # the delete column is not projected, but it is still used to match rows
+    assert result.column_names == ["name"]
+    assert result.column("name").to_pylist() == ["a", None, None]
+
+
+def test_task_to_record_batches_equality_deletes_multi_column_null_equal(tmpdir: str) -> None:
+    from pyiceberg.io.pyarrow import _read_equality_deletes
+
+    data_file, table_schema = _id_name_file(tmpdir)
+    delete_schema = pa.schema(
+        (
+            pa.field("id", pa.int32(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),
+            pa.field("name", pa.string(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "2"}),
+        )
+    )
+    delete_rows = pa.table(
+        [pa.array([1, 3, 4, 6], type=pa.int32()), pa.array(["a", None, "x", None])],
+        schema=delete_schema,
+    )
+    delete_file = _write_equality_delete_file(f"{tmpdir}/eq_deletes.parquet", delete_rows, [1, 2])
+    deletes = _read_equality_deletes(PyArrowFileIO(), delete_file)
+
+    result = pa.Table.from_batches(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file, delete_files=[delete_file]),
+            bound_row_filter=AlwaysTrue(),
+            projected_schema=table_schema,
+            table_schema=table_schema,
+            projected_field_ids={1, 2},
+            positional_deletes=None,
+            case_sensitive=True,
+            equality_deletes=[deletes],
+        )
+    )
+
+    # (1, a) matches, (3, null) and (6, null) match with null == null, (4, d) does not match (4, x)
+    assert result.to_pylist() == [{"id": 2, "name": "b"}, {"id": 4, "name": "d"}, {"id": None, "name": "e"}]
+
+
+def test_task_to_record_batches_equality_deletes_after_positional_deletes_with_filter(tmpdir: str) -> None:
+    from pyiceberg.expressions.visitors import bind
+    from pyiceberg.io.pyarrow import _read_equality_deletes
+
+    data_file, table_schema = _id_name_file(tmpdir)
+    delete_schema = pa.schema((pa.field("name", pa.string(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "2"}),))
+    delete_file = _write_equality_delete_file(
+        f"{tmpdir}/eq_deletes.parquet", pa.table([pa.array(["d"])], schema=delete_schema), [2]
+    )
+    deletes = _read_equality_deletes(PyArrowFileIO(), delete_file)
+
+    result = pa.Table.from_batches(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file, delete_files=[delete_file]),
+            bound_row_filter=bind(table_schema, GreaterThan("id", 1), case_sensitive=True),
+            projected_schema=table_schema,
+            table_schema=table_schema,
+            projected_field_ids={1, 2},
+            # position 1 holds id 2
+            positional_deletes=[pa.chunked_array([pa.array([1], type=pa.int64())])],
+            case_sensitive=True,
+            equality_deletes=[deletes],
+        )
+    )
+
+    assert result.column("id").to_pylist() == [3, 6]
+
+
+def test_task_to_record_batches_equality_deletes_column_missing_from_data_file(tmpdir: str) -> None:
+    from pyiceberg.io.pyarrow import _read_equality_deletes
+
+    data_file, _ = _id_name_file(tmpdir)
+    # column 3 was added to the table after the data file was written, so its values read as null
+    table_schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+        NestedField(2, "name", StringType(), required=False),
+        NestedField(3, "added", StringType(), required=False),
+    )
+    delete_schema = pa.schema(
+        (
+            pa.field("id", pa.int32(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),
+            pa.field("added", pa.string(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "3"}),
+        )
+    )
+    delete_rows = pa.table([pa.array([1, 2], type=pa.int32()), pa.array([None, "x"])], schema=delete_schema)
+    delete_file = _write_equality_delete_file(f"{tmpdir}/eq_deletes.parquet", delete_rows, [1, 3])
+    deletes = _read_equality_deletes(PyArrowFileIO(), delete_file)
+
+    result = pa.Table.from_batches(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file, delete_files=[delete_file]),
+            bound_row_filter=AlwaysTrue(),
+            projected_schema=table_schema,
+            table_schema=table_schema,
+            projected_field_ids={1, 2, 3},
+            positional_deletes=None,
+            case_sensitive=True,
+            equality_deletes=[deletes],
+        )
+    )
+
+    assert result.column("id").to_pylist() == [2, 3, 4, None, 6]
+
+
+def test_arrow_scan_applies_equality_deletes(tmpdir: str) -> None:
+    from pyiceberg.io.pyarrow import ArrowScan
+
+    data_file, table_schema = _id_name_file(tmpdir)
+    data_file.spec_id = 0
+    delete_schema = pa.schema((pa.field("id", pa.int32(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),))
+    delete_file = _write_equality_delete_file(
+        f"{tmpdir}/eq_deletes.parquet", pa.table([pa.array([1, 6], type=pa.int32())], schema=delete_schema), [1]
+    )
+    metadata = TableMetadataV2(
+        location="file://a/b/",
+        last_column_id=2,
+        format_version=2,
+        schemas=[table_schema],
+        partition_specs=[PartitionSpec()],
+    )
+
+    result = ArrowScan(metadata, PyArrowFileIO(), table_schema, AlwaysTrue()).to_table(
+        [FileScanTask(data_file, delete_files=[delete_file])]
+    )
+
+    assert result.column("id").to_pylist() == [2, 3, 4, None]
+
+
+def _variant_group(*extra: pa.Field) -> pa.StructType:
+    return pa.struct([pa.field("metadata", pa.binary(), nullable=False), pa.field("value", pa.binary(), nullable=False), *extra])
+
+
+def _variant_data_file(tmpdir: str, variant_type: pa.StructType, values: list[Any]) -> DataFile:
+    arrow_schema = pa.schema(
+        (
+            pa.field("id", pa.int32(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),
+            pa.field("v", variant_type, nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "2"}),
+        )
+    )
+    arrow_table = pa.table(
+        [pa.array(range(len(values)), type=pa.int32()), pa.array(values, type=variant_type)], schema=arrow_schema
+    )
+    return _write_table_to_data_file(f"{tmpdir}/variant.parquet", arrow_schema, arrow_table)
+
+
+VARIANT_TABLE_SCHEMA = Schema(
+    NestedField(1, "id", IntegerType(), required=True), NestedField(2, "v", VariantType(), required=False)
+)
+
+
+def test_variant_schema_to_pyarrow() -> None:
+    assert schema_to_pyarrow(VariantType()) == pa.struct(
+        [pa.field("metadata", pa.binary(), nullable=False), pa.field("value", pa.binary(), nullable=False)]
+    )
+
+
+def test_pyarrow_variant_group_to_iceberg() -> None:
+    arrow_schema = pa.schema([pa.field("v", _variant_group(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: "2"})])
+    assert pyarrow_to_schema(arrow_schema) == Schema(NestedField(2, "v", VariantType(), required=False))
+
+    # an Iceberg struct always has field ids on its fields, so it is never mistaken for a variant
+    struct_with_ids = pa.struct(
+        [
+            pa.field("metadata", pa.binary(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: "3"}),
+            pa.field("value", pa.binary(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: "4"}),
+        ]
+    )
+    converted = pyarrow_to_schema(pa.schema([pa.field("s", struct_with_ids, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "2"})]))
+    assert isinstance(converted.find_type(2), StructType)
+
+    # without field ids at all, a struct with metadata and value fields stays a struct
+    without_ids = _pyarrow_to_schema_without_ids(pa.schema([pa.field("s", _variant_group())]))
+    assert isinstance(without_ids.find_type("s"), StructType)
+
+
+def test_task_to_record_batches_reads_variant(tmpdir: str) -> None:
+    from pyiceberg.variant import to_json
+
+    values = [
+        {"metadata": b"\x01\x01\x00\x01a", "value": b"\x02\x01\x00\x00\x02\x0c\x01"},
+        {"metadata": b"\x01\x00\x00", "value": b"\x35just a string"},
+        None,
+    ]
+    data_file = _variant_data_file(tmpdir, _variant_group(), values)
+
+    result = pa.Table.from_batches(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=AlwaysTrue(),
+            projected_schema=VARIANT_TABLE_SCHEMA,
+            table_schema=VARIANT_TABLE_SCHEMA,
+            projected_field_ids={1, 2},
+            positional_deletes=None,
+            case_sensitive=True,
+            format_version=3,
+        )
+    )
+
+    assert result.schema.field("v").type == schema_to_pyarrow(VariantType())
+    assert result.column("v").to_pylist() == values
+    assert [to_json(v["metadata"], v["value"]) for v in values if v is not None] == ['{"a":1}', '"just a string"']
+
+
+def test_task_to_record_batches_shredded_variant_not_supported(tmpdir: str) -> None:
+    variant_type = pa.struct(
+        [
+            pa.field("metadata", pa.binary(), nullable=False),
+            pa.field("value", pa.binary(), nullable=True),
+            pa.field("typed_value", pa.int64(), nullable=True),
+        ]
+    )
+    data_file = _variant_data_file(tmpdir, variant_type, [{"metadata": b"\x01\x00\x00", "value": None, "typed_value": 1}])
+
+    batches = _task_to_record_batches(
+        PyArrowFileIO(),
+        FileScanTask(data_file),
+        bound_row_filter=AlwaysTrue(),
+        projected_schema=VARIANT_TABLE_SCHEMA,
+        table_schema=VARIANT_TABLE_SCHEMA,
+        projected_field_ids={1, 2},
+        positional_deletes=None,
+        case_sensitive=True,
+        format_version=3,
+    )
+    with pytest.raises(NotImplementedError, match="shredded variant"):
+        list(batches)
+
+    # a scan that does not project the variant column still works
+    id_schema = VARIANT_TABLE_SCHEMA.select("id")
+    result = pa.Table.from_batches(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=AlwaysTrue(),
+            projected_schema=id_schema,
+            table_schema=VARIANT_TABLE_SCHEMA,
+            projected_field_ids={1},
+            positional_deletes=None,
+            case_sensitive=True,
+            format_version=3,
+        )
+    )
+    assert result.column("id").to_pylist() == [0]
+
+
+def test_variant_read_from_struct_with_field_ids(tmpdir: str) -> None:
+    # a writer that assigned field ids to the variant fields surfaces a struct, which the table schema resolves
+    variant_type = pa.struct(
+        [
+            pa.field("metadata", pa.binary(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "3"}),
+            pa.field("value", pa.binary(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "4"}),
+        ]
+    )
+    values = [{"metadata": b"\x01\x00\x00", "value": b"\x00"}]
+    data_file = _variant_data_file(tmpdir, variant_type, values)
+
+    result = pa.Table.from_batches(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file),
+            bound_row_filter=AlwaysTrue(),
+            projected_schema=VARIANT_TABLE_SCHEMA,
+            table_schema=VARIANT_TABLE_SCHEMA,
+            projected_field_ids={1, 2},
+            positional_deletes=None,
+            case_sensitive=True,
+            format_version=3,
+        )
+    )
+    assert result.column("v").to_pylist() == values
+
+
+def test_write_variant_not_supported() -> None:
+    with pytest.raises(NotImplementedError, match="Writing variant is not supported"):
+        _check_pyarrow_schema_compatible(VARIANT_TABLE_SCHEMA, schema_to_pyarrow(VARIANT_TABLE_SCHEMA), format_version=3)
+
+
+def test_variant_statistics_are_counts_only(tmpdir: str) -> None:
+    values = [{"metadata": b"\x01\x00\x00", "value": b"\x00"}, None, {"metadata": b"\x01\x00\x00", "value": b"\x0c\x01"}]
+    data_file = _variant_data_file(tmpdir, _variant_group(), values)
+    parquet_metadata = pq.read_metadata(data_file.file_path)
+
+    statistics = data_file_statistics_from_parquet_metadata(
+        parquet_metadata=parquet_metadata,
+        stats_columns=compute_statistics_plan(VARIANT_TABLE_SCHEMA, {}),
+        parquet_column_mapping=parquet_path_to_id_mapping(VARIANT_TABLE_SCHEMA),
+    )
+
+    assert statistics.value_counts[2] == 3
+    assert statistics.null_value_counts[2] == 1
+    assert 2 not in statistics.column_aggregates
 
 
 def test_parse_location_defaults() -> None:

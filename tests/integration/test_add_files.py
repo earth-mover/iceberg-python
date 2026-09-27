@@ -150,7 +150,14 @@ def _create_table(
     )
 
 
-@pytest.fixture(name="format_version", params=[pytest.param(1, id="format_version=1"), pytest.param(2, id="format_version=2")])
+@pytest.fixture(
+    name="format_version",
+    params=[
+        pytest.param(1, id="format_version=1"),
+        pytest.param(2, id="format_version=2"),
+        pytest.param(3, id="format_version=3"),
+    ],
+)
 def format_version_fixture(request: pytest.FixtureRequest) -> Iterator[int]:
     """Fixture to run tests with different table format versions."""
     yield request.param
@@ -716,6 +723,8 @@ def test_add_files_with_large_and_regular_schema(spark: SparkSession, session_ca
 
 @pytest.mark.integration
 def test_add_files_with_timestamp_tz_ns_fails(session_catalog: Catalog, format_version: int, mocker: MockerFixture) -> None:
+    if format_version >= 3:
+        pytest.skip("Nanosecond timestamps are supported from format version 3")
     nanoseconds_schema_iceberg = Schema(NestedField(1, "quux", TimestamptzType()))
 
     nanoseconds_schema = pa.schema(
@@ -760,7 +769,7 @@ def test_add_files_with_timestamp_tz_ns_fails(session_catalog: Catalog, format_v
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_add_file_with_valid_nullability_diff(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
     identifier = f"default.test_table_with_valid_nullability_diff{format_version}"
     table_schema = Schema(
@@ -799,7 +808,7 @@ def test_add_file_with_valid_nullability_diff(spark: SparkSession, session_catal
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_add_files_with_valid_upcast(
     spark: SparkSession,
     session_catalog: Catalog,
@@ -851,7 +860,7 @@ def test_add_files_with_valid_upcast(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_add_files_subset_of_schema(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
     identifier = f"default.test_table_subset_of_schema{format_version}"
     tbl = _create_table(session_catalog, identifier, format_version)
@@ -888,7 +897,7 @@ def test_add_files_subset_of_schema(spark: SparkSession, session_catalog: Catalo
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_add_files_with_duplicate_files_in_file_paths(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
     identifier = f"default.test_table_duplicate_add_files_v{format_version}"
     tbl = _create_table(session_catalog, identifier, format_version)
@@ -902,7 +911,7 @@ def test_add_files_with_duplicate_files_in_file_paths(spark: SparkSession, sessi
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_add_files_that_referenced_by_current_snapshot(
     spark: SparkSession, session_catalog: Catalog, format_version: int
 ) -> None:
@@ -928,7 +937,7 @@ def test_add_files_that_referenced_by_current_snapshot(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_add_files_that_referenced_by_current_snapshot_with_check_duplicate_files_false(
     spark: SparkSession, session_catalog: Catalog, format_version: int
 ) -> None:
@@ -959,7 +968,7 @@ def test_add_files_that_referenced_by_current_snapshot_with_check_duplicate_file
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_add_files_that_referenced_by_current_snapshot_with_check_duplicate_files_true(
     spark: SparkSession, session_catalog: Catalog, format_version: int
 ) -> None:
