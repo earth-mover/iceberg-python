@@ -62,6 +62,7 @@ from pyiceberg.table.sorting import (
 from pyiceberg.table.statistics import BlobMetadata, PartitionStatisticsFile, StatisticsFile
 from pyiceberg.table.update import (
     AddPartitionSpecUpdate,
+    AddSchemaUpdate,
     AddSnapshotUpdate,
     AddSortOrderUpdate,
     AssertCreate,
@@ -84,6 +85,7 @@ from pyiceberg.table.update import (
     SetPropertiesUpdate,
     SetSnapshotRefUpdate,
     SetStatisticsUpdate,
+    UpgradeFormatVersionUpdate,
     _apply_table_update,
     _TableMetadataUpdateContext,
     update_table_metadata,
@@ -110,6 +112,7 @@ from pyiceberg.types import (
     PrimitiveType,
     StringType,
     StructType,
+    TimestampNanoType,
     TimestampType,
     TimestamptzType,
     TimeType,
@@ -1981,6 +1984,124 @@ def test_add_snapshot_update_updates_next_row_id(table_v3: Table) -> None:
 
     new_metadata = update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
     assert new_metadata.next_row_id == 11
+
+
+def test_add_snapshot_update_fails_without_added_rows(table_v3: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=19,
+        sequence_number=200,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+        first_row_id=1,
+    )
+
+    with pytest.raises(ValueError, match="Cannot add snapshot without added rows"):
+        update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+
+def test_add_snapshot_update_rejects_older_sequence_number_v3(table_v3: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=3055729675574597004,
+        sequence_number=34,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+        first_row_id=1,
+        added_rows=0,
+    )
+
+    with pytest.raises(ValueError, match="Cannot add snapshot with sequence number 34 older than last sequence number 34"):
+        update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+
+@pytest.mark.parametrize("table_fixture", [lf("table_v1"), lf("table_v2")])
+def test_add_snapshot_update_leaves_next_row_id_unset_below_v3(table_fixture: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=table_fixture.metadata.current_snapshot_id,
+        sequence_number=200,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=0,
+    )
+
+    new_metadata = update_table_metadata(table_fixture.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+    assert "next-row-id" not in json.loads(new_metadata.model_dump_json())
+
+
+@pytest.mark.parametrize("table_fixture", [lf("table_v1"), lf("table_v2")])
+def test_upgrade_to_v3(table_fixture: Table) -> None:
+    transaction = table_fixture.transaction().upgrade_table_version(format_version=3)
+    assert transaction._updates == (UpgradeFormatVersionUpdate(format_version=3),)
+
+    new_metadata = transaction.table_metadata
+    assert new_metadata.format_version == 3
+    assert new_metadata.next_row_id == 0
+    # Existing snapshots are left untouched: their rows have no row ids
+    assert new_metadata.snapshots == table_fixture.metadata.snapshots
+    assert all(snapshot.first_row_id is None for snapshot in new_metadata.snapshots)
+
+    validated = TableMetadataUtil.parse_obj(json.loads(new_metadata.model_dump_json()))
+    assert validated.format_version == 3
+    assert validated.next_row_id == 0
+
+
+def test_upgrade_to_same_version_is_noop(table_v3: Table) -> None:
+    assert update_table_metadata(table_v3.metadata, (UpgradeFormatVersionUpdate(format_version=3),)) == table_v3.metadata
+    assert table_v3.transaction().upgrade_table_version(format_version=3)._updates == ()
+
+
+def test_upgrade_beyond_supported_version_is_rejected(table_v3: Table) -> None:
+    with pytest.raises(ValueError, match="Unsupported table format version: 4"):
+        table_v3.transaction().upgrade_table_version(format_version=4)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Unsupported table format version: 4"):
+        update_table_metadata(table_v3.metadata, (UpgradeFormatVersionUpdate(format_version=4),))
+
+
+def test_add_schema_update_rejects_v3_types_on_v2(table_v2: Table) -> None:
+    schema = Schema(NestedField(field_id=1, name="ts", field_type=TimestampNanoType(), required=False), schema_id=10)
+    with pytest.raises(ValueError, match="timestamp_ns is only supported in 3 or higher. Current format version is: 2"):
+        update_table_metadata(table_v2.metadata, (AddSchemaUpdate(schema_=schema),))
+
+    with pytest.raises(ValueError, match="timestamp_ns is only supported in 3 or higher"):
+        with table_v2.update_schema() as update:
+            update.add_column("ts_ns", TimestampNanoType())
+
+
+def test_add_column_with_default_requires_v3(table_v2: Table, table_v3: Table) -> None:
+    with pytest.raises(ValueError, match="default values require format version 3 or higher, current format version is 2"):
+        UpdateSchema(transaction=table_v2.transaction()).add_column("added", IntegerType(), default_value=22)
+    with pytest.raises(ValueError, match="default values require format version 3 or higher"):
+        UpdateSchema(transaction=table_v2.transaction()).add_column("added", IntegerType(), required=True, default_value=22)
+
+    allowed = UpdateSchema(transaction=table_v2.transaction(), allow_incompatible_changes=True)
+    assert allowed.add_column("added", IntegerType(), default_value=22)._apply().find_field("added").initial_default == 22
+
+    v3_schema = UpdateSchema(transaction=table_v3.transaction()).add_column(
+        "added", IntegerType(), required=True, default_value=22
+    )
+    field = v3_schema._apply().find_field("added")
+    assert (field.required, field.initial_default, field.write_default) == (True, 22, 22)
+
+
+def test_union_by_name_uses_table_format_version(table_v3: Table) -> None:
+    import pyarrow as pa
+
+    new_schema = pa.schema([pa.field("ts_ns", pa.timestamp("ns"), nullable=True)])
+    applied = UpdateSchema(transaction=table_v3.transaction()).union_by_name(new_schema)._apply()
+    assert applied.find_type("ts_ns") == TimestampNanoType()
+
+
+def test_add_schema_update_accepts_v3_types_on_v3(table_v3: Table) -> None:
+    schema = Schema(NestedField(field_id=10, name="ts", field_type=TimestampNanoType(), required=False), schema_id=10)
+    new_metadata = update_table_metadata(table_v3.metadata, (AddSchemaUpdate(schema_=schema),))
+    assert new_metadata.schema_by_id(10) == schema
 
 
 def model_roundtrips(model: BaseModel) -> bool:

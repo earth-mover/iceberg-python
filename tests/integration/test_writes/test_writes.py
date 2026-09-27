@@ -126,6 +126,48 @@ def table_v2_appended_with_null(session_catalog: Catalog, arrow_table_with_null:
 
 
 @pytest.fixture(scope="session", autouse=True)
+def table_v3_with_null(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_v3_with_null"
+    tbl = _create_table(session_catalog, identifier, {"format-version": "3"}, [arrow_table_with_null])
+    assert tbl.format_version == 3, f"Expected v3, got: v{tbl.format_version}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def table_v3_without_data(session_catalog: Catalog, arrow_table_without_data: pa.Table) -> None:
+    identifier = "default.arrow_table_v3_without_data"
+    tbl = _create_table(session_catalog, identifier, {"format-version": "3"}, [arrow_table_without_data])
+    assert tbl.format_version == 3, f"Expected v3, got: v{tbl.format_version}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def table_v3_with_only_nulls(session_catalog: Catalog, arrow_table_with_only_nulls: pa.Table) -> None:
+    identifier = "default.arrow_table_v3_with_only_nulls"
+    tbl = _create_table(session_catalog, identifier, {"format-version": "3"}, [arrow_table_with_only_nulls])
+    assert tbl.format_version == 3, f"Expected v3, got: v{tbl.format_version}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def table_v3_appended_with_null(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_v3_appended_with_null"
+    tbl = _create_table(session_catalog, identifier, {"format-version": "3"}, 2 * [arrow_table_with_null])
+    assert tbl.format_version == 3, f"Expected v3, got: v{tbl.format_version}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def table_v2_v3_appended_with_null(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
+    identifier = "default.arrow_table_v2_v3_appended_with_null"
+    tbl = _create_table(session_catalog, identifier, {"format-version": "2"}, [arrow_table_with_null])
+    assert tbl.format_version == 2, f"Expected v2, got: v{tbl.format_version}"
+
+    with tbl.transaction() as tx:
+        tx.upgrade_table_version(format_version=3)
+
+    tbl.append(arrow_table_with_null)
+
+    assert tbl.format_version == 3, f"Expected v3, got: v{tbl.format_version}"
+
+
+@pytest.fixture(scope="session", autouse=True)
 def table_v1_v2_appended_with_null(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
     identifier = "default.arrow_table_v1_v2_appended_with_null"
     tbl = _create_table(session_catalog, identifier, {"format-version": "1"}, [arrow_table_with_null])
@@ -140,14 +182,14 @@ def table_v1_v2_appended_with_null(session_catalog: Catalog, arrow_table_with_nu
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_count(spark: SparkSession, format_version: int) -> None:
     df = spark.table(f"default.arrow_table_v{format_version}_with_null")
     assert df.count() == 3, "Expected 3 rows"
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_filter_null(spark: SparkSession, arrow_table_with_null: pa.Table, format_version: int) -> None:
     identifier = f"default.arrow_table_v{format_version}_with_null"
     df = spark.table(identifier)
@@ -157,7 +199,7 @@ def test_query_filter_null(spark: SparkSession, arrow_table_with_null: pa.Table,
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_filter_without_data(spark: SparkSession, arrow_table_with_null: pa.Table, format_version: int) -> None:
     identifier = f"default.arrow_table_v{format_version}_without_data"
     df = spark.table(identifier)
@@ -167,7 +209,7 @@ def test_query_filter_without_data(spark: SparkSession, arrow_table_with_null: p
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_filter_only_nulls(spark: SparkSession, arrow_table_with_null: pa.Table, format_version: int) -> None:
     identifier = f"default.arrow_table_v{format_version}_with_only_nulls"
     df = spark.table(identifier)
@@ -177,7 +219,7 @@ def test_query_filter_only_nulls(spark: SparkSession, arrow_table_with_null: pa.
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_query_filter_appended_null(spark: SparkSession, arrow_table_with_null: pa.Table, format_version: int) -> None:
     identifier = f"default.arrow_table_v{format_version}_appended_with_null"
     df = spark.table(identifier)
@@ -187,11 +229,14 @@ def test_query_filter_appended_null(spark: SparkSession, arrow_table_with_null: 
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "identifier", ["default.arrow_table_v1_v2_appended_with_null", "default.arrow_table_v2_v3_appended_with_null"]
+)
 def test_query_filter_v1_v2_append_null(
     spark: SparkSession,
     arrow_table_with_null: pa.Table,
+    identifier: str,
 ) -> None:
-    identifier = "default.arrow_table_v1_v2_appended_with_null"
     df = spark.table(identifier)
     for col in arrow_table_with_null.column_names:
         assert df.where(f"{col} is null").count() == 2, f"Expected 1 row for {col}"
@@ -395,7 +440,7 @@ def test_data_files(spark: SparkSession, session_catalog: Catalog, arrow_table_w
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_object_storage_data_files(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -444,7 +489,7 @@ def test_python_writes_with_spark_snapshot_reads(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_python_writes_special_character_column_with_spark_reads(
     spark: SparkSession, session_catalog: Catalog, format_version: int
 ) -> None:
@@ -488,7 +533,7 @@ def test_python_writes_special_character_column_with_spark_reads(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_python_writes_dictionary_encoded_column_with_spark_reads(
     spark: SparkSession, session_catalog: Catalog, format_version: int
 ) -> None:
@@ -521,7 +566,7 @@ def test_python_writes_dictionary_encoded_column_with_spark_reads(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_python_writes_with_small_and_large_types_spark_reads(
     spark: SparkSession, session_catalog: Catalog, format_version: int
 ) -> None:
@@ -624,7 +669,7 @@ def test_write_bin_pack_data_files(spark: SparkSession, session_catalog: Catalog
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 @pytest.mark.parametrize(
     "properties, expected_compression_name",
     [
@@ -713,7 +758,7 @@ def test_write_parquet_unsupported_properties(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_spark_writes_orc_pyiceberg_reads(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
     """Test that ORC files written by Spark can be read by PyIceberg."""
     identifier = f"default.spark_writes_orc_pyiceberg_reads_v{format_version}"
@@ -924,7 +969,7 @@ def test_duckdb_url_import(warehouse: Path, arrow_table_with_null: pa.Table) -> 
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_write_and_evolve(session_catalog: Catalog, format_version: int) -> None:
     identifier = f"default.arrow_write_data_and_evolve_schema_v{format_version}"
 
@@ -967,7 +1012,7 @@ def test_write_and_evolve(session_catalog: Catalog, format_version: int) -> None
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 @pytest.mark.parametrize("catalog", [lf("session_catalog_hive"), lf("session_catalog")])
 def test_create_table_transaction(catalog: Catalog, format_version: int) -> None:
     identifier = f"default.arrow_create_table_transaction_{catalog.name}_{format_version}"
@@ -1019,7 +1064,7 @@ def test_create_table_transaction(catalog: Catalog, format_version: int) -> None
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 @pytest.mark.parametrize("catalog", [lf("session_catalog_hive"), lf("session_catalog")])
 def test_create_table_with_non_default_values(catalog: Catalog, table_schema_with_all_types: Schema, format_version: int) -> None:
     identifier = f"default.arrow_create_table_transaction_with_non_default_values_{catalog.name}_{format_version}"
@@ -1070,7 +1115,7 @@ def test_create_table_with_non_default_values(catalog: Catalog, table_schema_wit
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_table_properties_int_value(
     session_catalog: Catalog,
     arrow_table_with_null: pa.Table,
@@ -1087,7 +1132,7 @@ def test_table_properties_int_value(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_table_properties_raise_for_none_value(
     session_catalog: Catalog,
     arrow_table_with_null: pa.Table,
@@ -1104,7 +1149,7 @@ def test_table_properties_raise_for_none_value(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_inspect_snapshots(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -1215,7 +1260,7 @@ def test_write_within_transaction(spark: SparkSession, session_catalog: Catalog,
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_hive_catalog_storage_descriptor(
     session_catalog_hive: HiveCatalog,
     pa_schema: pa.Schema,
@@ -1234,7 +1279,7 @@ def test_hive_catalog_storage_descriptor(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_hive_catalog_storage_descriptor_has_changed(
     session_catalog_hive: HiveCatalog,
     pa_schema: pa.Schema,
@@ -1331,7 +1376,7 @@ def test_sanitize_character_partitioned_avro_bug(catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_cross_platform_special_character_compatibility(
     spark: SparkSession, session_catalog: Catalog, format_version: int
 ) -> None:
@@ -1411,7 +1456,7 @@ def test_cross_platform_special_character_compatibility(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_table_write_subset_of_schema(session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
     identifier = "default.test_table_write_subset_of_schema"
     tbl = _create_table(session_catalog, identifier, {"format-version": format_version}, [arrow_table_with_null])
@@ -1424,7 +1469,7 @@ def test_table_write_subset_of_schema(session_catalog: Catalog, arrow_table_with
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 @pytest.mark.filterwarnings("ignore:Delete operation did not match any records")
 def test_table_write_out_of_order_schema(session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
     identifier = "default.test_table_write_out_of_order_schema"
@@ -1443,7 +1488,7 @@ def test_table_write_out_of_order_schema(session_catalog: Catalog, arrow_table_w
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_table_write_schema_with_valid_nullability_diff(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -1475,7 +1520,7 @@ def test_table_write_schema_with_valid_nullability_diff(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_table_write_schema_with_valid_upcast(
     spark: SparkSession,
     session_catalog: Catalog,
@@ -1525,7 +1570,7 @@ def test_table_write_schema_with_valid_upcast(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_write_all_timestamp_precision(
     mocker: MockerFixture,
     spark: SparkSession,
@@ -1566,7 +1611,7 @@ def test_write_all_timestamp_precision(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_merge_manifests(session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
     tbl_a = _create_table(
         session_catalog,
@@ -1618,7 +1663,7 @@ def test_merge_manifests(session_catalog: Catalog, arrow_table_with_null: pa.Tab
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_merge_manifests_file_content(session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
     tbl_a = _create_table(
         session_catalog,
@@ -1641,14 +1686,14 @@ def test_merge_manifests_file_content(session_catalog: Catalog, arrow_table_with
 
     # verify the sequence number of tbl_a's only manifest file
     tbl_a_manifest = tbl_a.current_snapshot().manifests(tbl_a.io)[0]  # type: ignore
-    assert tbl_a_manifest.sequence_number == (3 if format_version == 2 else 0)
-    assert tbl_a_manifest.min_sequence_number == (1 if format_version == 2 else 0)
+    assert tbl_a_manifest.sequence_number == (3 if format_version >= 2 else 0)
+    assert tbl_a_manifest.min_sequence_number == (1 if format_version >= 2 else 0)
 
     # verify the manifest entries of tbl_a, in which the manifests are merged
     tbl_a_entries = tbl_a.inspect.entries().to_pydict()
     assert tbl_a_entries["status"] == [1, 0, 0]
-    assert tbl_a_entries["sequence_number"] == [3, 2, 1] if format_version == 2 else [0, 0, 0]
-    assert tbl_a_entries["file_sequence_number"] == [3, 2, 1] if format_version == 2 else [0, 0, 0]
+    assert tbl_a_entries["sequence_number"] == ([3, 2, 1] if format_version >= 2 else [0, 0, 0])
+    assert tbl_a_entries["file_sequence_number"] == ([3, 2, 1] if format_version >= 2 else [0, 0, 0])
     for i in range(3):
         tbl_a_data_file = tbl_a_entries["data_file"][i]
         assert tbl_a_data_file["column_sizes"] == [
@@ -1989,7 +2034,7 @@ def test_writing_null_structs(session_catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_abort_table_transaction_on_exception(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -2048,7 +2093,7 @@ def test_write_optional_list(session_catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_double_commit_transaction(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -2065,7 +2110,7 @@ def test_double_commit_transaction(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_evolve_and_write(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -2373,10 +2418,11 @@ def test_nanosecond_support_on_catalog(
 
     _create_table(session_catalog, identifier, {"format-version": "3"}, schema=arrow_table_schema_with_all_timestamp_precisions)
 
-    with pytest.raises(NotImplementedError, match="Writing V3 is not yet supported"):
-        catalog.create_table(
-            "ns.table1", schema=arrow_table_schema_with_all_timestamp_precisions, properties={"format-version": "3"}
-        )
+    table_v3 = catalog.create_table(
+        "ns.table1", schema=arrow_table_schema_with_all_timestamp_precisions, properties={"format-version": "3"}
+    )
+    assert table_v3.format_version == 3
+    assert table_v3.metadata.next_row_id == 0
 
     with pytest.raises(
         UnsupportedPyArrowTypeException, match=re.escape("Column 'timestamp_ns' has an unsupported type: timestamp[ns]")
@@ -2387,7 +2433,7 @@ def test_nanosecond_support_on_catalog(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_stage_only_delete(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -2438,7 +2484,7 @@ def test_stage_only_delete(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_stage_only_append(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -2485,7 +2531,7 @@ def test_stage_only_append(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_stage_only_overwrite_files(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -2532,7 +2578,6 @@ def test_stage_only_overwrite_files(
     assert parent_snapshot_id == [None, first_snapshot, second_snapshot, second_snapshot, second_snapshot]
 
 
-@pytest.mark.skip("V3 writer support is not enabled.")
 @pytest.mark.integration
 def test_v3_write_and_read_row_lineage(spark: SparkSession, session_catalog: Catalog) -> None:
     """Test writing to a v3 table and reading with Spark."""
@@ -2569,6 +2614,9 @@ def test_v3_write_and_read_row_lineage(spark: SparkSession, session_catalog: Cat
         "Expected next_row_id to be incremented by the number of added rows"
     )
 
+    rows = spark.sql(f"SELECT int, _row_id FROM {identifier} ORDER BY int").collect()
+    assert [(row["int"], row["_row_id"]) for row in rows] == [(1, 0), (2, 1), (3, 2)]
+
 
 # RecordBatchReader streaming append/overwrite — see https://github.com/apache/iceberg-python/issues/2152
 #
@@ -2579,7 +2627,7 @@ def test_v3_write_and_read_row_lineage(spark: SparkSession, session_catalog: Cat
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_append_record_batch_reader(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -2602,7 +2650,7 @@ def test_append_record_batch_reader(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_overwrite_record_batch_reader(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:
@@ -2623,7 +2671,7 @@ def test_overwrite_record_batch_reader(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_append_record_batch_reader_multifile(
     spark: SparkSession, session_catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int
 ) -> None:

@@ -51,7 +51,7 @@ from pyiceberg.table.delete_file_index import DeleteFileIndex
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
-from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadata
+from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata
 from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import (
@@ -332,7 +332,7 @@ class Transaction:
         Returns:
             The alter table builder.
         """
-        if format_version not in {1, 2}:
+        if not 1 <= format_version <= SUPPORTED_TABLE_FORMAT_VERSION:
             raise ValueError(f"Unsupported table format version: {format_version}")
 
         if format_version < self.table_metadata.format_version:
@@ -565,7 +565,7 @@ class Transaction:
                     table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
                 )
                 for data_file in data_files:
-                    append_files.append_data_file(data_file)
+                    append_files._append_written_data_file(data_file)
 
     def dynamic_partition_overwrite(
         self, df: pa.Table, snapshot_properties: dict[str, str] = EMPTY_DICT, branch: str | None = MAIN_BRANCH
@@ -638,7 +638,7 @@ class Transaction:
         with self._append_snapshot_producer(snapshot_properties, branch=branch) as append_files:
             append_files.commit_uuid = append_snapshot_commit_uuid
             for data_file in data_files:
-                append_files.append_data_file(data_file)
+                append_files._append_written_data_file(data_file)
 
     def overwrite(
         self,
@@ -736,7 +736,7 @@ class Transaction:
                     table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
                 )
                 for data_file in data_files:
-                    append_files.append_data_file(data_file)
+                    append_files._append_written_data_file(data_file)
 
     def delete(
         self,
@@ -837,7 +837,7 @@ class Transaction:
                     for original_data_file, replaced_data_files in replaced_files:
                         overwrite_snapshot.delete_data_file(original_data_file)
                         for replaced_data_file in replaced_data_files:
-                            overwrite_snapshot.append_data_file(replaced_data_file)
+                            overwrite_snapshot._append_written_data_file(replaced_data_file)
 
         if not delete_snapshot.files_affected and not delete_snapshot.rewrites_needed:
             warnings.warn("Delete operation did not match any records", stacklevel=2)

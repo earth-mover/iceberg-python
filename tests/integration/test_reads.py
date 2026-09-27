@@ -978,10 +978,21 @@ def test_upgrade_table_version(catalog: Catalog) -> None:
             transaction.upgrade_table_version(format_version=1)
     assert "Cannot downgrade v2 table to v1" in str(e.value)
 
+    with table_test_table_version.transaction() as transaction:
+        transaction.upgrade_table_version(format_version=3)
+
+    assert table_test_table_version.format_version == 3
+    assert table_test_table_version.metadata.next_row_id == 0
+
+    # The upgraded metadata must persist and reload from the catalog
+    reloaded = catalog.load_table("default.test_table_version")
+    assert reloaded.format_version == 3
+    assert reloaded.metadata.next_row_id == 0
+
     with pytest.raises(ValueError) as e:
         with table_test_table_version.transaction() as transaction:
-            transaction.upgrade_table_version(format_version=3)
-    assert "Unsupported table format version: 3" in str(e.value)
+            transaction.upgrade_table_version(format_version=4)
+    assert "Unsupported table format version: 4" in str(e.value)
 
 
 @pytest.mark.integration
@@ -1243,8 +1254,9 @@ def test_initial_default(catalog: Catalog, spark: SparkSession) -> None:
 
     tbl.append(one_column)
 
-    # Do the bump version through Spark, since PyIceberg does not support this (yet)
+    # Bump the version through Spark, and refresh since default values require format version 3
     spark.sql(f"ALTER TABLE {identifier} SET TBLPROPERTIES('format-version'='3')")
+    tbl.refresh()
 
     with tbl.update_schema() as upd:
         upd.add_column("so_true", BooleanType(), required=False, default_value=True)

@@ -25,6 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
+from types import TracebackType
 from typing import TYPE_CHECKING, Generic
 
 from pyiceberg.avro.codecs import AvroCompressionCodec
@@ -51,6 +52,7 @@ from pyiceberg.manifest import (
     ManifestEntry,
     ManifestEntryStatus,
     ManifestFile,
+    ManifestListWriterV3,
     ManifestWriter,
     write_manifest,
     write_manifest_list,
@@ -141,6 +143,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     _parent_snapshot_id: int | None
     _starting_snapshot_id: int | None
     _added_data_files: list[DataFile]
+    _written_data_files: list[DataFile]
     _manifest_num_counter: itertools.count[int]
     _deleted_data_files: set[DataFile]
     _compression: AvroCompressionCodec
@@ -168,6 +171,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         self._operation = operation
         self._snapshot_id = self._transaction.table_metadata.new_snapshot_id()
         self._added_data_files = []
+        self._written_data_files = []
         self._deleted_data_files = set()
         self.snapshot_properties = snapshot_properties
         self._manifest_num_counter = itertools.count(0)
@@ -209,18 +213,19 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         self._deleted_data_files.add(data_file)
         return self
 
-    def _calculate_added_rows(self, manifests: list[ManifestFile]) -> int:
-        """Calculate the number of added rows from a list of manifest files."""
-        added_rows = 0
-        for manifest in manifests:
-            if manifest.added_snapshot_id is None or manifest.added_snapshot_id == self._snapshot_id:
-                if manifest.added_rows_count is None:
-                    raise ValueError(
-                        "Cannot determine number of added rows in snapshot because "
-                        f"the entry for manifest {manifest.manifest_path} is missing the field `added-rows-count`"
-                    )
-                added_rows += manifest.added_rows_count
-        return added_rows
+    def _append_written_data_file(self, data_file: DataFile) -> _SnapshotProducer[U]:
+        """Append a data file that was written for this operation, so it is removed again if the operation fails."""
+        self._written_data_files.append(data_file)
+        return self.append_data_file(data_file)
+
+    def _delete_written_data_files(self) -> None:
+        """Best-effort removal of the data files written for this operation."""
+        for data_file in self._written_data_files:
+            try:
+                self._io.delete(data_file.file_path)
+            except Exception:
+                logger.warning("Failed to delete uncommitted data file: %s", data_file.file_path, exc_info=True)
+        self._written_data_files.clear()
 
     @abstractmethod
     def _deleted_entries(self) -> list[ManifestEntry]: ...
@@ -334,20 +339,26 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         manifest_list_file_path = location_provider.new_metadata_location(file_name)
         self._written_manifest_lists.append(manifest_list_file_path)
 
+        table_metadata = self._transaction.table_metadata
+        first_row_id: int | None = None
+        added_rows: int | None = None
+        if table_metadata.format_version >= 3:
+            first_row_id = table_metadata.next_row_id
+
         with write_manifest_list(
-            format_version=self._transaction.table_metadata.format_version,
+            format_version=table_metadata.format_version,
             output_file=self._io.new_output(manifest_list_file_path),
             snapshot_id=self._snapshot_id,
             parent_snapshot_id=self._parent_snapshot_id,
             sequence_number=next_sequence_number,
             avro_compression=self._compression,
+            first_row_id=first_row_id,
         ) as writer:
             writer.add_manifests(new_manifests)
 
-        first_row_id: int | None = None
-
-        if self._transaction.table_metadata.format_version >= 3:
-            first_row_id = self._transaction.table_metadata.next_row_id
+        if isinstance(writer, ManifestListWriterV3) and first_row_id is not None:
+            # Row ids assigned to the manifests in this snapshot, including pre-upgrade manifests without one
+            added_rows = writer.next_row_id - first_row_id
 
         snapshot = Snapshot(
             snapshot_id=self._snapshot_id,
@@ -355,8 +366,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             manifest_list=manifest_list_file_path,
             sequence_number=next_sequence_number,
             summary=summary,
-            schema_id=self._transaction.table_metadata.current_schema_id,
+            schema_id=table_metadata.current_schema_id,
             first_row_id=first_row_id,
+            added_rows=added_rows,
         )
 
         add_snapshot_update = AddSnapshotUpdate(snapshot=snapshot)
@@ -418,8 +430,20 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         return manifest.fetch_manifest_entry(io=self._io, discard_deleted=discard_deleted)
 
     def commit(self) -> None:
+        try:
+            updates, requirements = self._commit()
+        except Exception:
+            # Nothing references the files written so far, so remove them instead of leaving orphans
+            self._clean_all_uncommitted()
+            raise
         self._transaction._register_snapshot_producer(self)
-        super().commit()
+        self._transaction._apply(updates, requirements)
+
+    def __exit__(self, exctype: type[BaseException] | None, excinst: BaseException | None, exctb: TracebackType | None) -> None:
+        """Commit the snapshot, or remove the files written for it if an exception has been raised."""
+        if excinst is not None:
+            self._clean_all_uncommitted()
+        super().__exit__(exctype, excinst, exctb)
 
     def _cleanup_uncommitted(self) -> None:
         """Delete manifest files and manifest lists from failed retry attempts."""
@@ -439,7 +463,8 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             self._written_manifest_lists = self._written_manifest_lists[-1:]
 
     def _clean_all_uncommitted(self) -> None:
-        """Clean up all manifests and manifest lists on abort."""
+        """Clean up all written data files, manifests and manifest lists on abort."""
+        self._delete_written_data_files()
         for path in itertools.chain(self._uncommitted_manifests, self._written_manifests):
             try:
                 self._io.delete(path)

@@ -144,12 +144,23 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         return self
 
     def union_by_name(
-        # TODO: Move TableProperties.DEFAULT_FORMAT_VERSION to separate file and set that as format_version default.
         self,
         new_schema: Schema | pa.Schema,
-        format_version: TableVersion = 2,
+        format_version: TableVersion | None = None,
     ) -> UpdateSchema:
+        """Merge a new schema into the current schema by matching fields by name.
+
+        Args:
+            new_schema: The schema to merge in.
+            format_version: Format version used to convert a PyArrow schema; defaults to the table's format version.
+
+        Returns:
+            This for method chaining.
+        """
         from pyiceberg.catalog import Catalog
+
+        if format_version is None:
+            format_version = self._transaction.table_metadata.format_version
 
         visit_with_partner(
             Catalog._convert_schema_if_needed(new_schema, format_version=format_version),
@@ -181,7 +192,8 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
             field_type: Type for the new column.
             doc: Documentation string for the new column.
             required: Whether the new column is required.
-            default_value: Default value for the new column.
+            default_value: Default value for the new column. Requires format version 3, unless incompatible
+                changes are allowed.
 
         Returns:
             This for method chaining.
@@ -232,6 +244,13 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
                 raise ValueError(f"Invalid default value: {e}") from e
         else:
             initial_default = default_value  # type: ignore
+
+        format_version = self._transaction.table_metadata.format_version
+        if initial_default is not None and format_version < 3 and not self._allow_incompatible_changes:
+            raise ValueError(
+                f"Incompatible change: default values require format version 3 or higher, "
+                f"current format version is {format_version}: {full_name}"
+            )
 
         if (required and initial_default is None) and not self._allow_incompatible_changes:
             # Table format version 1 and 2 cannot add required column because there is no initial value

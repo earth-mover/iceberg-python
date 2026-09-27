@@ -251,7 +251,6 @@ def test_v3_row_lineage_columns_match_spark(session_catalog: Catalog, spark: "Sp
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="first_row_id is not inherited from the manifest on read")
 def test_v3_first_row_id_inherited(session_catalog: Catalog) -> None:
     table = session_catalog.load_table("default.test_positional_mor_deletes_v3")
     snapshot = table.current_snapshot()
@@ -278,7 +277,6 @@ def test_v3_inspect_exposes_v3_fields(session_catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, raises=ValueError, reason="Writing v3 manifests is not supported")
 def test_v3_append_to_rest_table(session_catalog: Catalog, probe_identifier: str) -> None:
     schema = Schema(NestedField(1, "id", IntegerType(), required=True))
     table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "3"})
@@ -293,7 +291,6 @@ def test_v3_append_to_rest_table(session_catalog: Catalog, probe_identifier: str
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, raises=ValueError, reason="Upgrading to format version 3 is not supported")
 def test_v3_upgrade_from_v2(session_catalog: Catalog, spark: "SparkSession", probe_identifier: str) -> None:  # type: ignore[name-defined] # noqa: F821
     schema = Schema(NestedField(1, "id", IntegerType(), required=True))
     session_catalog.create_table(probe_identifier, schema, properties={"format-version": "2"})
@@ -305,4 +302,112 @@ def test_v3_upgrade_from_v2(session_catalog: Catalog, spark: "SparkSession", pro
     assert table.metadata.format_version == 3
     assert table.metadata.next_row_id == 0
     spark.sql(f"INSERT INTO rest.{probe_identifier} VALUES (2)")
-    assert session_catalog.load_table(probe_identifier).metadata.next_row_id == 1
+    # The pre-upgrade manifest has no first-row-id, so the first v3 commit assigns row ids to its row as well
+    assert session_catalog.load_table(probe_identifier).metadata.next_row_id == 2
+
+
+def _ids(values: list[int]) -> pa.Table:
+    return pa.Table.from_arrays([pa.array(values, pa.int32())], schema=pa.schema([pa.field("id", pa.int32(), nullable=False)]))
+
+
+@pytest.mark.integration
+def test_v3_pyiceberg_appends_read_by_spark_with_row_lineage(
+    session_catalog: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+    probe_identifier: str,
+) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "3"})
+    table.append(_ids([10, 11, 12]))
+    table.append(_ids([13, 14]))
+
+    table = session_catalog.load_table(probe_identifier)
+    assert table.metadata.next_row_id == 5
+    first, second = table.snapshots()
+    assert (first.first_row_id, first.added_rows, second.first_row_id, second.added_rows) == (0, 3, 3, 2)
+
+    rows = spark.sql(f"SELECT id, _row_id, _last_updated_sequence_number FROM rest.{probe_identifier} ORDER BY id").collect()
+    assert [(r["id"], r["_row_id"]) for r in rows] == [(10, 0), (11, 1), (12, 2), (13, 3), (14, 4)]
+    assert [r["_last_updated_sequence_number"] for r in rows] == [first.sequence_number] * 3 + [second.sequence_number] * 2
+
+    # Spark can keep writing to the table PyIceberg wrote
+    spark.sql(f"DELETE FROM rest.{probe_identifier} WHERE id = 11")
+    rows = spark.sql(f"SELECT id, _row_id FROM rest.{probe_identifier} ORDER BY id").collect()
+    assert [(r["id"], r["_row_id"]) for r in rows] == [(10, 0), (12, 2), (13, 3), (14, 4)]
+    table = session_catalog.load_table(probe_identifier)
+    assert sorted(table.scan().to_arrow()["id"].to_pylist()) == [10, 12, 13, 14]
+    assert table.metadata.next_row_id >= 5
+
+
+@pytest.mark.integration
+def test_v3_pyiceberg_copy_on_write_read_by_spark(
+    session_catalog: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+    probe_identifier: str,
+) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "3"})
+    table.append(_ids([1, 2, 3]))
+    table.append(_ids([4, 5]))
+    # Rewrites the first data file: its surviving rows get new row ids, the untouched file keeps its own
+    table.delete("id = 2")
+    row_ids = {r["id"]: r["_row_id"] for r in spark.sql(f"SELECT id, _row_id FROM rest.{probe_identifier}").collect()}
+    assert sorted(row_ids) == [1, 3, 4, 5]
+    assert (row_ids[4], row_ids[5]) == (3, 4)
+    assert row_ids[1] >= 5 and row_ids[3] >= 5
+
+    table.overwrite(_ids([6]), overwrite_filter="id = 5")
+    table = session_catalog.load_table(probe_identifier)
+    assert table.metadata.next_row_id == sum(s.added_rows or 0 for s in table.snapshots())
+    rows = spark.sql(f"SELECT id, _row_id FROM rest.{probe_identifier} ORDER BY id").collect()
+    assert [r["id"] for r in rows] == [1, 3, 4, 6]
+    assert len({r["_row_id"] for r in rows}) == 4
+    assert all(r["_row_id"] < table.metadata.next_row_id for r in rows)
+
+
+@pytest.mark.integration
+def test_v3_hive_table_written_by_pyiceberg_read_by_spark(
+    session_catalog_hive: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+) -> None:
+    # Hive stores the metadata PyIceberg serializes, unlike REST where the server builds it
+    identifier = f"default.test_v3_hive_{uuid.uuid4().hex[:8]}"
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    table = session_catalog_hive.create_table(identifier, schema, properties={"format-version": "3"})
+    try:
+        assert table.metadata.next_row_id == 0
+        table.append(_ids([1, 2]))
+        table.append(_ids([3]))
+        assert session_catalog_hive.load_table(identifier).metadata.next_row_id == 3
+
+        properties = {row.key: row.value for row in spark.sql(f"SHOW TBLPROPERTIES hive.{identifier}").collect()}
+        assert properties["format-version"] == "3"
+        rows = spark.sql(f"SELECT id, _row_id FROM hive.{identifier} ORDER BY id").collect()
+        assert [(r["id"], r["_row_id"]) for r in rows] == [(1, 0), (2, 1), (3, 2)]
+    finally:
+        session_catalog_hive.drop_table(identifier)
+
+
+@pytest.mark.integration
+def test_v3_upgrade_then_pyiceberg_append_read_by_spark(
+    session_catalog: Catalog,
+    spark: "SparkSession",  # type: ignore[name-defined] # noqa: F821
+    probe_identifier: str,
+) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "2"})
+    table.append(_ids([1, 2]))
+    with table.transaction() as transaction:
+        transaction.upgrade_table_version(3)
+
+    table = session_catalog.load_table(probe_identifier)
+    table.append(_ids([3]))
+    table = session_catalog.load_table(probe_identifier)
+    assert table.metadata.format_version == 3
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and (snapshot.first_row_id, snapshot.added_rows) == (0, 3)
+    assert table.metadata.next_row_id == 3
+
+    rows = spark.sql(f"SELECT id, _row_id FROM rest.{probe_identifier} ORDER BY id").collect()
+    assert [r["id"] for r in rows] == [1, 2, 3]
+    assert sorted(r["_row_id"] for r in rows) == [0, 1, 2]

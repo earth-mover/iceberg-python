@@ -133,7 +133,7 @@ def test_create_table_without_namespace(catalog: Catalog, table_schema_nested: S
         catalog.create_table(table_name, table_schema_nested)
 
 
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_create_table_transaction(catalog: Catalog, format_version: int) -> None:
     identifier = f"default.arrow_create_table_transaction_{catalog.name}_{format_version}"
     try:
@@ -720,6 +720,106 @@ def test_append_table(catalog: Catalog, table_schema_simple: Schema, test_table_
     assert df == table.scan().to_arrow()
 
 
+def test_v3_row_lineage_on_commit(catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier) -> None:
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    table = catalog.create_table(test_table_identifier, table_schema_simple, properties={"format-version": "3"})
+    assert table.format_version == 3
+    assert table.metadata.next_row_id == 0
+
+    df = pa.Table.from_pydict(
+        {"foo": ["a", "b", "c"], "bar": [1, 2, 3], "baz": [True, False, True]},
+        schema=schema_to_pyarrow(table_schema_simple),
+    )
+    table.append(df)
+    table.append(df.slice(0, 2))
+
+    first, second = table.snapshots()
+    assert (first.first_row_id, first.added_rows) == (0, 3)
+    assert (second.first_row_id, second.added_rows) == (3, 2)
+    assert table.metadata.next_row_id == 5
+
+    # Fast appends carry over the manifests of earlier snapshots with their first row ids
+    manifests = second.manifests(table.io)
+    assert {m.first_row_id for m in manifests} == {0, 3}
+    assert all(entry.data_file.first_row_id is None for m in manifests for entry in _raw_entries(table, m))
+
+    # A copy-on-write delete assigns fresh row ids to the rewritten data file and keeps them for untouched rows
+    table.delete("bar = 1")
+    reloaded = catalog.load_table(test_table_identifier)
+    assert reloaded.metadata.next_row_id == reloaded.snapshots()[-1].first_row_id + reloaded.snapshots()[-1].added_rows  # type: ignore[operator]
+    assert reloaded.metadata.next_row_id == sum(s.added_rows or 0 for s in reloaded.snapshots())
+    assert sorted(reloaded.scan().to_arrow()["bar"].to_pylist()) == [2, 2, 3]
+
+
+def _raw_entries(table: Any, manifest: Any) -> list[Any]:
+    """Read manifest entries without first row id inheritance, to check what the writer stored."""
+    from pyiceberg.avro.file import AvroFile
+    from pyiceberg.manifest import MANIFEST_ENTRY_SCHEMAS, DataFile, ManifestEntry
+
+    with AvroFile[ManifestEntry](
+        table.io.new_input(manifest.manifest_path), MANIFEST_ENTRY_SCHEMAS[3], read_types={-1: ManifestEntry, 2: DataFile}
+    ) as reader:
+        return list(reader)
+
+
+def test_v3_upgrade_then_append(catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier) -> None:
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    table = catalog.create_table(test_table_identifier, table_schema_simple, properties={"format-version": "2"})
+    df = pa.Table.from_pydict(
+        {"foo": ["a", "b"], "bar": [1, 2], "baz": [True, False]},
+        schema=schema_to_pyarrow(table_schema_simple),
+    )
+    table.append(df)
+
+    with table.transaction() as txn:
+        txn.upgrade_table_version(format_version=3)
+    table = catalog.load_table(test_table_identifier)
+    assert table.format_version == 3
+    assert table.metadata.next_row_id == 0
+    assert table.snapshots()[0].first_row_id is None
+
+    table.append(df.slice(0, 1))
+    snapshot = table.snapshots()[-1]
+    # The pre-upgrade manifest has no first row id yet, so it is assigned one together with the new manifest
+    assert (snapshot.first_row_id, snapshot.added_rows) == (0, 3)
+    assert table.metadata.next_row_id == 3
+    assert all(m.first_row_id is not None for m in snapshot.manifests(table.io))
+    assert len(table.scan().to_arrow()) == 3
+
+
+def test_failed_append_removes_written_files(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pyiceberg.table.update.snapshot as snapshot_module
+
+    catalog.create_namespace(Catalog.namespace_from(test_table_identifier))
+    table = catalog.create_table(test_table_identifier, table_schema_simple)
+    df = pa.Table.from_pydict(
+        {"foo": ["a"], "bar": [1], "baz": [True]},
+        schema=schema_to_pyarrow(table_schema_simple),
+    )
+
+    written: list[str] = []
+    original_append = snapshot_module._SnapshotProducer._append_written_data_file
+
+    def _track(self: Any, data_file: Any) -> Any:
+        written.append(data_file.file_path)
+        return original_append(self, data_file)
+
+    def _failing_write_manifest(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("Simulated manifest write failure")
+
+    monkeypatch.setattr(snapshot_module._SnapshotProducer, "_append_written_data_file", _track)
+    monkeypatch.setattr(snapshot_module, "write_manifest", _failing_write_manifest)
+
+    with pytest.raises(OSError, match="Simulated manifest write failure"):
+        table.append(df)
+
+    assert len(written) == 1
+    assert not table.io.new_input(written[0]).exists()
+    assert catalog.load_table(test_table_identifier).current_snapshot() is None
+
+
 # Test writes
 def test_table_writes_metadata_to_custom_location(
     catalog: Catalog,
@@ -803,7 +903,7 @@ def test_table_metadata_writes_reflect_latest_path(
     assert table.location_provider().new_metadata_location("metadata.json") == f"{new_metadata_path}/metadata.json"
 
 
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_write_and_evolve(catalog: Catalog, format_version: int) -> None:
     identifier = f"default.arrow_write_data_and_evolve_schema_v{format_version}"
 
@@ -849,7 +949,7 @@ def test_write_and_evolve(catalog: Catalog, format_version: int) -> None:
 
 
 # Merge manifests
-@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("format_version", [1, 2, 3])
 def test_merge_manifests_local_file_system(catalog: Catalog, arrow_table_with_null: pa.Table, format_version: int) -> None:
     # To catch manifest file name collision bug during merge:
     # https://github.com/apache/iceberg-python/pull/363#discussion_r1660691918
