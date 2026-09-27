@@ -153,7 +153,7 @@ from pyiceberg.table.delete_file import DeleteFileSet
 from pyiceberg.table.deletion_vector import read_deletion_vectors
 from pyiceberg.table.locations import load_location_provider
 from pyiceberg.table.metadata import TableMetadata
-from pyiceberg.table.metadata_columns import LAST_UPDATED_SEQUENCE_NUMBER, ROW_ID
+from pyiceberg.table.metadata_columns import LAST_UPDATED_SEQUENCE_NUMBER, ROW_ID, schema_with_row_lineage
 from pyiceberg.table.name_mapping import NameMapping, apply_name_mapping
 from pyiceberg.transforms import IdentityTransform, TruncateTransform
 from pyiceberg.typedef import EMPTY_DICT, Properties, Record, TableVersion
@@ -3321,7 +3321,21 @@ class ParquetFormatModel(FileFormatModel):
 FileFormatFactory.register(ParquetFormatModel())
 
 
-def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteTask]) -> Iterator[DataFile]:
+def _row_lineage_write_schema(schema: Schema) -> Schema:
+    """Return the schema with the row lineage columns appended, for copying rows with their lineage."""
+    if (lineage_schema := schema_with_row_lineage(schema)) is None:
+        raise ValueError("Cannot preserve row lineage: a table column uses a reserved row lineage column name")
+    return lineage_schema
+
+
+def write_file(
+    io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteTask], preserve_row_lineage: bool = False
+) -> Iterator[DataFile]:
+    """Write the tasks to data files.
+
+    With ``preserve_row_lineage``, the ``_row_id`` and ``_last_updated_sequence_number`` columns of the tasks are
+    written as physical columns with their reserved field IDs, so rows copied by a rewrite keep their lineage.
+    """
     from pyiceberg.table import DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE, TableProperties
 
     file_format = FileFormat(
@@ -3339,6 +3353,8 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
             file_schema = sanitized_schema
         else:
             file_schema = table_schema
+        if preserve_row_lineage:
+            file_schema = _row_lineage_write_schema(file_schema)
 
         downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         batches = [
@@ -3577,8 +3593,12 @@ def _dataframe_to_data_files(
     io: FileIO,
     write_uuid: uuid.UUID | None = None,
     counter: itertools.count[int] | None = None,
+    preserve_row_lineage: bool = False,
 ) -> Iterable[DataFile]:
     """Convert a PyArrow Table or RecordBatchReader into DataFiles.
+
+    With ``preserve_row_lineage``, ``df`` also holds the ``_row_id`` and ``_last_updated_sequence_number``
+    columns of copied rows, and they are written into the data files (see :func:`write_file`).
 
     For a ``pa.Table`` the data is materialised in memory and bin-packed into
     target-sized files (with partition splitting if the table is partitioned).
@@ -3601,7 +3621,8 @@ def _dataframe_to_data_files(
         property_name=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
         default=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
     )
-    name_mapping = table_metadata.schema().name_mapping
+    table_schema = table_metadata.schema()
+    name_mapping = (_row_lineage_write_schema(table_schema) if preserve_row_lineage else table_schema).name_mapping
     downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
     task_schema = pyarrow_to_schema(
         df.schema,
@@ -3620,6 +3641,7 @@ def _dataframe_to_data_files(
         yield from write_file(
             io=io,
             table_metadata=table_metadata,
+            preserve_row_lineage=preserve_row_lineage,
             tasks=(
                 WriteTask(write_uuid=write_uuid, task_id=next(counter), record_batches=batches, schema=task_schema)
                 for batches in bin_pack_record_batches(df, target_file_size)
@@ -3631,6 +3653,7 @@ def _dataframe_to_data_files(
         yield from write_file(
             io=io,
             table_metadata=table_metadata,
+            preserve_row_lineage=preserve_row_lineage,
             tasks=(
                 WriteTask(write_uuid=write_uuid, task_id=next(counter), record_batches=batches, schema=task_schema)
                 for batches in bin_pack_arrow_table(df, target_file_size)
@@ -3641,6 +3664,7 @@ def _dataframe_to_data_files(
         yield from write_file(
             io=io,
             table_metadata=table_metadata,
+            preserve_row_lineage=preserve_row_lineage,
             tasks=(
                 WriteTask(
                     write_uuid=write_uuid,

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pydantic_core import ValidationError
 from pytest_lazy_fixtures import lf
@@ -743,12 +744,106 @@ def test_v3_row_lineage_on_commit(catalog: Catalog, table_schema_simple: Schema,
     assert {m.first_row_id for m in manifests} == {0, 3}
     assert all(entry.data_file.first_row_id is None for m in manifests for entry in _raw_entries(table, m))
 
-    # A copy-on-write delete assigns fresh row ids to the rewritten data file and keeps them for untouched rows
+    # A copy-on-write delete keeps the row ids of the rows it copies into the rewritten data file
     table.delete("bar = 1")
     reloaded = catalog.load_table(test_table_identifier)
     assert reloaded.metadata.next_row_id == reloaded.snapshots()[-1].first_row_id + reloaded.snapshots()[-1].added_rows  # type: ignore[operator]
     assert reloaded.metadata.next_row_id == sum(s.added_rows or 0 for s in reloaded.snapshots())
     assert sorted(reloaded.scan().to_arrow()["bar"].to_pylist()) == [2, 2, 3]
+
+
+def _lineage(table: Any) -> dict[int, tuple[int, int]]:
+    """Return the row id and last updated sequence number of each row, keyed by ``bar``."""
+    rows = table.scan(selected_fields=("bar", "_row_id", "_last_updated_sequence_number")).to_arrow().to_pylist()
+    return {row["bar"]: (row["_row_id"], row["_last_updated_sequence_number"]) for row in rows}
+
+
+def _v3_table_with_two_files(catalog: Catalog, schema: Schema, identifier: Identifier) -> Any:
+    catalog.create_namespace(Catalog.namespace_from(identifier))
+    table = catalog.create_table(identifier, schema, properties={"format-version": "3"})
+    arrow_schema = schema_to_pyarrow(schema)
+    table.append(
+        pa.Table.from_pydict({"foo": ["a", "b", "c"], "bar": [1, 2, 3], "baz": [True, False, True]}, schema=arrow_schema)
+    )
+    table.append(pa.Table.from_pydict({"foo": ["d", "e"], "bar": [4, 5], "baz": [False, True]}, schema=arrow_schema))
+    assert _lineage(table) == {1: (0, 1), 2: (1, 1), 3: (2, 1), 4: (3, 2), 5: (4, 2)}
+    return table
+
+
+def test_v3_copy_on_write_delete_preserves_row_lineage(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    table = _v3_table_with_two_files(catalog, table_schema_simple, test_table_identifier)
+
+    table.delete("bar = 5")
+
+    assert table.snapshots()[-1].summary.operation == Operation.OVERWRITE
+    assert _lineage(table) == {1: (0, 1), 2: (1, 1), 3: (2, 1), 4: (3, 2)}
+    # Copied rows still count as added rows, so the next row id stays above every assigned id
+    assert table.metadata.next_row_id == 6
+
+    # The lineage columns are stored in the rewritten file but do not surface in normal reads
+    rewritten = [task.file for task in table.scan(row_filter="bar = 4").plan_files()]
+    assert len(rewritten) == 1
+    physical_schema = pq.read_schema(table.io.new_input(rewritten[0].file_path).open())
+    assert physical_schema.field("_row_id").metadata[b"PARQUET:field_id"] == b"2147483540"
+    assert physical_schema.field("_last_updated_sequence_number").metadata[b"PARQUET:field_id"] == b"2147483539"
+    assert table.scan().to_arrow().column_names == ["foo", "bar", "baz"]
+    assert table.scan(selected_fields=("bar", "_row_id")).to_arrow().column_names == ["bar", "_row_id"]
+
+
+def test_v3_copy_on_write_delete_preserves_row_lineage_through_deletion_vector(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    table = _v3_table_with_two_files(catalog, table_schema_simple, test_table_identifier)
+    table.delete("bar = 1")
+    assert _lineage(table) == {2: (1, 1), 3: (2, 1), 4: (3, 2), 5: (4, 2)}
+
+    # Positions of a later deletion vector refer to the rewritten file, which keeps the copied lineage
+    table.transaction().set_properties(
+        {TableProperties.DELETE_MODE: TableProperties.DELETE_MODE_MERGE_ON_READ}
+    ).commit_transaction()
+    table.delete("bar = 2")
+    assert table.snapshots()[-1].summary.operation == Operation.DELETE
+    assert _lineage(table) == {3: (2, 1), 4: (3, 2), 5: (4, 2)}
+
+
+def test_v3_overwrite_preserves_row_lineage(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    table = _v3_table_with_two_files(catalog, table_schema_simple, test_table_identifier)
+
+    table.overwrite(
+        pa.Table.from_pydict({"foo": ["f"], "bar": [6], "baz": [False]}, schema=schema_to_pyarrow(table_schema_simple)),
+        overwrite_filter="bar = 5",
+    )
+
+    # Row 4 is copied with its lineage, row 6 is new and gets an id from its own snapshot
+    lineage = _lineage(table)
+    assert {bar: lineage[bar] for bar in (1, 2, 3, 4)} == {1: (0, 1), 2: (1, 1), 3: (2, 1), 4: (3, 2)}
+    assert lineage[6] == (6, 4)
+    assert table.metadata.next_row_id == 7
+
+
+def test_v3_upsert_preserves_row_lineage_of_unchanged_rows(
+    catalog: Catalog, table_schema_simple: Schema, test_table_identifier: Identifier
+) -> None:
+    table = _v3_table_with_two_files(catalog, table_schema_simple, test_table_identifier)
+
+    result = table.upsert(
+        pa.Table.from_pydict(
+            {"foo": ["a", "B"], "bar": [1, 2], "baz": [True, False]}, schema=schema_to_pyarrow(table_schema_simple)
+        )
+    )
+    assert (result.rows_updated, result.rows_inserted) == (1, 0)
+
+    lineage = _lineage(table)
+    # Untouched rows keep their lineage, including the ones copied out of the rewritten file
+    assert {bar: lineage[bar] for bar in (1, 3, 4, 5)} == {1: (0, 1), 3: (2, 1), 4: (3, 2), 5: (4, 2)}
+    # The updated row is written as a new row with a fresh id and the sequence number of its snapshot
+    updated_snapshot = table.snapshots()[-1]
+    assert lineage[2][0] >= 5
+    assert lineage[2][1] == updated_snapshot.sequence_number
 
 
 def _raw_entries(table: Any, manifest: Any) -> list[Any]:

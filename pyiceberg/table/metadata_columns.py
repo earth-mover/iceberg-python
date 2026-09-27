@@ -60,6 +60,21 @@ def is_metadata_field_id(field_id: int) -> bool:
     return field_id in _METADATA_COLUMNS_BY_ID
 
 
+def schema_with_row_lineage(schema: Schema) -> Schema | None:
+    """Return the schema with the row lineage columns appended, or None when a table column uses one of their names.
+
+    Copy-on-write rewrites write this schema, so the row lineage of copied rows is kept in the new data files.
+    """
+    if any(_has_field(schema, field.name, case_sensitive=True) for field in ROW_LINEAGE_COLUMNS):
+        return None
+    return Schema(
+        *schema.fields,
+        *ROW_LINEAGE_COLUMNS,
+        schema_id=schema.schema_id,
+        identifier_field_ids=schema.identifier_field_ids,
+    )
+
+
 def project_schema(schema: Schema, selected_fields: tuple[str, ...], case_sensitive: bool = True) -> Schema:
     """Select columns from a table schema, appending any requested metadata columns in the requested order.
 

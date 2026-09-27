@@ -63,7 +63,7 @@ from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
 from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata
-from pyiceberg.table.metadata_columns import is_metadata_column, project_schema
+from pyiceberg.table.metadata_columns import is_metadata_column, project_schema, schema_with_row_lineage
 from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import (
@@ -820,6 +820,15 @@ class Transaction:
             commit_uuid = uuid.uuid4()
             counter = itertools.count(0)
 
+            # Rows copied into the rewritten files keep their row IDs and last updated sequence numbers,
+            # which are written as physical columns (see https://iceberg.apache.org/spec/#row-lineage)
+            projected_schema = self.table_metadata.schema()
+            preserve_row_lineage = False
+            if self.table_metadata.format_version >= 3:
+                if (lineage_schema := schema_with_row_lineage(projected_schema)) is not None:
+                    projected_schema = lineage_schema
+                    preserve_row_lineage = True
+
             replaced_files: list[tuple[DataFile, list[DataFile]]] = []
             # This will load the Parquet file into memory, including:
             #   - Filter out the rows based on the delete filter
@@ -832,7 +841,7 @@ class Transaction:
                 df = ArrowScan(
                     table_metadata=self.table_metadata,
                     io=self._table.io,
-                    projected_schema=self.table_metadata.schema(),
+                    projected_schema=projected_schema,
                     row_filter=AlwaysTrue(),
                 ).to_table(tasks=[original_file])
                 filtered_df = df.filter(preserve_row_filter)
@@ -851,6 +860,7 @@ class Transaction:
                                     table_metadata=self.table_metadata,
                                     write_uuid=commit_uuid,
                                     counter=counter,
+                                    preserve_row_lineage=preserve_row_lineage,
                                 )
                             ),
                         )

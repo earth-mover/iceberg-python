@@ -1847,6 +1847,11 @@ and `_last_updated_sequence_number` from the data sequence number of the file. B
 added before row lineage was enabled. The columns are read-only: appending a dataframe that contains them is rejected by
 the schema compatibility check.
 
+Rows keep their lineage when `delete()`, `overwrite()` or `upsert()` rewrites a data file (copy-on-write): the copied
+rows' `_row_id` and `_last_updated_sequence_number` are stored in the rewritten file. Merge-on-read deletes leave the
+data files in place, so row ids are unchanged as well. Rows that `upsert()` updates are written as new rows with new
+row ids. Copied rows still count toward the snapshot's `added-rows`, so `next-row-id` advances past them.
+
 ### Variant columns
 
 On format version 3 tables, `variant` columns are read as a struct of two binaries, `metadata` and `value`, holding

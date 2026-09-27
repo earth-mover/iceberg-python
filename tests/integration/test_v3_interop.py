@@ -413,19 +413,21 @@ def test_v3_pyiceberg_copy_on_write_read_by_spark(
     table = session_catalog.create_table(probe_identifier, schema, properties={"format-version": "3"})
     table.append(_ids([1, 2, 3]))
     table.append(_ids([4, 5]))
-    # Rewrites the first data file: its surviving rows get new row ids, the untouched file keeps its own
+    first_sequence_number, second_sequence_number = (s.sequence_number for s in table.snapshots())
+    # Rewrites the first data file: the copied rows keep their row ids and last updated sequence numbers
     table.delete("id = 2")
-    row_ids = {r["id"]: r["_row_id"] for r in spark.sql(f"SELECT id, _row_id FROM rest.{probe_identifier}").collect()}
-    assert sorted(row_ids) == [1, 3, 4, 5]
-    assert (row_ids[4], row_ids[5]) == (3, 4)
-    assert row_ids[1] >= 5 and row_ids[3] >= 5
+    rows = spark.sql(f"SELECT id, _row_id, _last_updated_sequence_number FROM rest.{probe_identifier} ORDER BY id").collect()
+    assert [(r["id"], r["_row_id"]) for r in rows] == [(1, 0), (3, 2), (4, 3), (5, 4)]
+    assert [r["_last_updated_sequence_number"] for r in rows] == [first_sequence_number] * 2 + [second_sequence_number] * 2
 
     table.overwrite(_ids([6]), overwrite_filter="id = 5")
     table = session_catalog.load_table(probe_identifier)
     assert table.metadata.next_row_id == sum(s.added_rows or 0 for s in table.snapshots())
-    rows = spark.sql(f"SELECT id, _row_id FROM rest.{probe_identifier} ORDER BY id").collect()
+    rows = spark.sql(f"SELECT id, _row_id, _last_updated_sequence_number FROM rest.{probe_identifier} ORDER BY id").collect()
     assert [r["id"] for r in rows] == [1, 3, 4, 6]
-    assert len({r["_row_id"] for r in rows}) == 4
+    assert [r["_row_id"] for r in rows[:3]] == [0, 2, 3]
+    assert [r["_last_updated_sequence_number"] for r in rows[:3]] == [first_sequence_number] * 2 + [second_sequence_number]
+    assert rows[3]["_row_id"] >= 5
     assert all(r["_row_id"] < table.metadata.next_row_id for r in rows)
 
 
